@@ -2,7 +2,7 @@
 
 > 本仓库是 [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) **v1.6.0** 的增强分支。
 >
-> **改动只涉及一个文件：`proxy/app.py`**（119,717 B → 202,492 B）。其余文件与上游 v1.6.0 逐字节一致，
+> **改动只涉及一个文件：`proxy/app.py`**（119,717 B → 233,256 B，5,849 行）。其余文件与上游 v1.6.0 逐字节一致，
 > 可直接用上游的 `install.sh` / `extend.sh` / `restore.sh` 安装与卸载。
 
 ---
@@ -39,6 +39,7 @@
 | v52 | 自动扫库 | 落盘/删除成功后**借 App 凭证主动调飞牛扫描接口** |
 | v53 | 歌词归属 | 歌词落地归属重定 + `.lyricref` 专用映射 + **孤儿歌词自愈** |
 | v54 | 歌词贴身 | **歌词永远跟着音频走**：选路重排 + 短路条件收紧 + 存量歌词提升自愈 |
+| v55 | 搜索结果排序 | 补全封面 + 真音质（网易云批量 / 酷我单曲）；稳定重排 `(-有海报, -音质档, idx)`；首屏四层保证 + 确定性判据；搜索页封面后台预取 |
 
 ---
 
@@ -358,6 +359,95 @@ v53 把「已有歌词优先」提到最前，引入了一个回归：只要**�
 
 ---
 
+## 六、搜索结果有海报 + 高音质优先排序（v55）
+
+**需求**（Request D）：「搜索歌曲能否优先将有海报并且高质量音源排在前面显示」。
+
+上游 v1.6.0 的搜索入口本身没有「质量」维度：三音源（musicbox / musicdl / lxmusic）各自返回结果，
+按**任务创建顺序**拼接，谁先返回谁靠前；在线条目天生没有封面 URL、音质是按扩展名硬编的展示值，
+于是首屏基本是「没海报 + 标称 mp3」，且与质量无关。v55 在聚合流程里加三层（补全 → 排序 → 首屏免疫），
+把「带封面且高码率/无损」的条目顶到第一屏。
+
+三处根因与对策：
+
+| # | 根因 | 对策 |
+|---|---|---|
+| 1 | 在线条目**天生没有封面 URL**（lx 恒空、musicdl 真机超时、musicbox 极少） | 补全层 `_enrich_search_items()` 回填封面 + 真音质 |
+| 2 | 音质是**伪造**的：`bitrate = 1411000 if 无损扩展名 else 320000`，且 `ext` 恒为 mp3 ⇒ 任何歌都显示 320000 | 排序层用「扩展名推导」与「补全结果」**较大者**判定音质档，不改 `ext`、对取流零风险 |
+| 3 | 首屏页码**钉在重排之前**（`netease_wait_s=3.0s` 到点就分配并按 guid 固定，之后重排改不了首屏） | 首屏四层保证（见下） |
+
+### 6.1 补全层：一次批量请求拿到「封面 + 真音质」
+
+| 来源 | 接口 | 实测 | 拿到什么 |
+|---|---|---|---|
+| 网易云（覆盖 `lx→wy` 与 `netease`） | `POST music.163.com/api/v3/song/detail?c=[{"id":N},…]` | **1 次请求 / 25 首 / 0.171s** | `al.picUrl`（25/25 有封面）+ `sq/hr/h/m/l` 音质对象（sq=20/25 无损，h.br=320000 全有） |
+| 酷我（`lx→kw`） | `wapi.kuwo.cn/api/www/music/musicInfo?mid=<rid>` | 0.11s/首，`Semaphore(6)` 并发限流 | `pic`/`albumpic` + `hasLossless` |
+
+`_enrich_search_items()` 流程：① 先用 `meta_cache.json` 回填（重启后仍有效，**0 请求**）；
+② 网易云走**一次**批量详情（`_netease_detail_bulk`，带正/负缓存）；③ 酷我走单曲详情（`_kw_poster_quality`）；
+④ 结果写回条目 + `meta_cache.json`（`cover_url` / `quality_rank` / `lossless` / `no_cover`）。
+**只处理前 30 条**（第一屏），失败永不抛错 —— 补不上就是不补。
+
+### 6.2 排序层：稳定重排，只动在线块
+
+`rank_search_items()`：稳定排序（同档保持原始源顺序，`idx` 兜底 ⇒ 完全稳定），排序键 `(-有海报, -音质档, idx)`。
+
+音质档 `_search_item_quality_rank()`（3 最高）：
+
+```
+3 = 无损扩展名（flac/wav/ape/wv/aiff/alac/dsf/dff/tta/tak）或码率 ≥ 900k
+2 = 高码率有损扩展名（m4a/aac/opus/ogg/mp4）或码率 ≥ 256k
+1 = 其它有损（mp3…）
+0 = 未知
+```
+
+**关键细节**：档位取「扩展名推导」与「补全结果」的**较大者**。只信补全会出现自相矛盾 ——
+真机踩到 `ext=aac` 被网易云 `l` 档标成 1，于是「显示 AAC 却排在 mp3 后面」。取 max 只影响排序、不改 `ext`。
+
+### 6.3 首屏四层保证：排序一定作用在第一屏
+
+针对根因 3，四层一起上：
+
+1. **聚合内边收边排**：每收到一批源结果就 `deduplicate → rank_search_items → _resync_published_pages`，
+   即使 `netease_wait_s` 到点时聚合还没跑完，第一页分配的也已是排好序的顺序；
+2. **首屏多等一小会儿**：`search_rank_wait_s`（默认 1.5s），让「补全 + 重排」在分配页码之前完成；
+3. **分页按 guid 去重分配**（替代下标切片）：池子重排后仍「永远取最好的剩余条目」，且不跨页重复；
+4. **已发布页重排后对齐**（`_resync_published_pages()`）：只换序、不增删，任何一次下拉刷新即为排好序的顺序。
+
+### 6.4 确定性：排序绝不依赖「缓存预热进度」
+
+`_search_item_has_poster()` 只认「条目 / `meta_cache` 里的封面 URL」（= `build_online_track` 真正返回给 App 的 coverUrl），
+**刻意不看磁盘封面缓存** —— 否则 `_prefetch_online_covers` 异步落盘过程中「有海报」判定会翻转，同关键词连搜两次顺序就不一致。
+旧辅助函数 `_has_cached_poster()` 已删除。
+
+### 6.5 可观测性探针（写 `access_probe.log`）
+
+```
+[searchrank]  n=71 poster(top30) 30->30 lossless(top10)=10 moved=0 head=稻香(治愈版)
+[poolrank]    kw=稻香 13:稻香(治愈版) 13:《稻香》童声 …          ← 池子真实档位
+[pagealloc]   kw=稻香 p=1 n=30 13:稻香(治愈版) …                ← 首屏真实档位
+[searchenrich] cap=30 pending=9 ne=0 kw=1 resolved=22
+```
+
+格式 `<有海报><音质档>:<标题前 8 字>`，可直接肉眼核验「排序是否真的单调」。
+
+新增开关（`.env` 可覆盖，全部有默认值，不配即生效）：
+
+```ini
+FNMUSIC_SEARCH_RANK='cover_quality'     # 排序策略：cover_quality（海报优先）/ quality_cover（音质优先）/ off
+FNMUSIC_SEARCH_ENRICH='true'            # 是否补全搜索结果的海报与音质档
+FNMUSIC_SEARCH_ENRICH_LIMIT=30          # 只补第一屏条数
+FNMUSIC_SEARCH_ENRICH_WAIT_S=1.5        # 聚合末尾等补全的上限
+FNMUSIC_SEARCH_RANK_WAIT_S=1.5          # 首屏等「补全 + 重排」落定的上限
+```
+
+**实测（真机端到端，搜索 周杰伦 / 稻香 / 空心）**：首屏有海报占比 **21~30 / 30**（top10 恒为 100%），
+首屏前 10 位**全部 `ext=flac` + 有封面**（v54 为全部 `ext=mp3`、无封面），搜索页封面接口 `/static/cover`
+**0.001~0.002s**（v54 现抓 ~4s → 手机端超时 → 占位图），同一关键词重复搜索顺序一致。
+验收报告见 [`reports/fnmusic-v55-报告.md`](reports/fnmusic-v55-报告.md)。
+
+---
+
 ## 验证与报告
 
 | 脚本 | 内容 |
@@ -366,9 +456,11 @@ v53 把「已有歌词优先」提到最前，引入了一个回归：只要**�
 | [`patches/_v52_check.py`](patches/_v52_check.py) | 73 项（= v51 全部 + v52 新增 44 项：鉴权头识别/TTL、待办合并/兜底、探针不泄漏 cookie） |
 | [`patches/_v53_check.py`](patches/_v53_check.py) | 117 项（= v52 全部 + v53 新增 44 项：歌词路由、映射、自愈安全边界） |
 | [`patches/_v54_check.py`](patches/_v54_check.py) | **163 项**（= v53 全部 + v54 新增 46 项：歌词落点回归守卫、存量提升、越界安全边界） |
+| [`patches/_v55_check.py`](patches/_v55_check.py) | **188 项**（= v54 全部 163 项 + v55 新增 25 项：补全 / 排序 / 首屏分页免疫 / 确定性判据） |
 | [`patches/_v52_e2e_*.sh`](patches/) | 真机端到端（下载侧 / 删除侧 / 兜底通道） |
 | [`patches/_v54_e2e.py`](patches/_v54_e2e.py) | 真机端到端：复现「收藏后歌词必须贴身」（真实 token 调真实收藏接口，含清理与状态还原） |
-| [`patches/_build_v50.py`](patches/_build_v50.py) ~ [`_build_v54.py`](patches/_build_v54.py) | 带自校验断言的增量构建器（每步 `src.count()` 断言 + `compile()` 语法校验） |
+| [`patches/_v55_e2e.py`](patches/_v55_e2e.py) | 真机端到端：搜索 周杰伦 / 稻香 / 空心，首屏「有海报 + 无损」优先、顺序稳定、封面接口 200 真图（4/4 轮全绿） |
+| [`patches/_build_v50.py`](patches/_build_v50.py) ~ [`_build_v55.py`](patches/_build_v55.py) | 带自校验断言的增量构建器（每步 `src.count()` 断言 + `compile()` 语法校验） |
 
 验收报告（含真机证据、DB 前后对比、回滚步骤）见 [`reports/`](reports/)：
 
@@ -376,6 +468,7 @@ v53 把「已有歌词优先」提到最前，引入了一个回归：只要**�
 - [`reports/fnmusic-v52-报告.md`](reports/fnmusic-v52-报告.md) —— 自动扫库
 - [`reports/fnmusic-v53-报告.md`](reports/fnmusic-v53-报告.md) —— 歌词归属与孤儿自愈
 - [`reports/fnmusic-v54-报告.md`](reports/fnmusic-v54-报告.md) —— 歌词贴身（修复 v53 回归）
+- [`reports/fnmusic-v55-报告.md`](reports/fnmusic-v55-报告.md) —— 搜索结果有海报 + 高音质优先排序
 
 ### 沙箱里怎么跑单元测试
 

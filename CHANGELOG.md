@@ -3,6 +3,35 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.6.0+patch3] - 2026-09-18
+
+### 新增
+
+- **搜索结果「有海报 + 高音质」优先排序**：搜索在线歌曲时，按 `(-有海报, -音质档, 原始顺序)`
+  稳定重排，把「带封面且高码率/无损」的条目顶到第一屏前端。
+  - **补全层** `_enrich_search_items()`：网易云**一次批量详情**
+    （`POST music.163.com/api/v3/song/detail`，1 次请求 / 25 首 / 0.171s，拿到 `al.picUrl` 封面
+    + `sq/hr/h/m/l` 真实音质档）+ 酷我单曲详情
+    （`wapi.kuwo.cn/api/www/music/musicInfo?mid=`，0.11s/首，`Semaphore(6)` 并发），只补第一屏前 30 条；
+  - **排序层** `rank_search_items()`：稳定排序，音质档取「扩展名推导」与「补全结果」**较大者**，
+    避免「显示 AAC 却排到 mp3 后面」；
+  - **首屏四层保证**：聚合内边收边排 + 首屏多等 `search_rank_wait_s`（1.5s）+ 分页按 guid 去重分配
+    + 已发布页重排后对齐（`_resync_published_pages`），确保排序一定作用在第一屏；
+  - **确定性**：「有海报」判据只认条目 / `meta_cache` 里的封面 URL，**不看磁盘预热进度**，
+    同一关键词重复搜索顺序一致；搜索页接入与每日推荐同款的封面后台预取 `_prefetch_online_covers()`。
+
+### 新增配置
+
+- `FNMUSIC_SEARCH_RANK`（默认 `cover_quality`；可选 `quality_cover` / `off`）
+- `FNMUSIC_SEARCH_ENRICH`（默认 `true`）、`FNMUSIC_SEARCH_ENRICH_LIMIT`（默认 `30`）、
+  `FNMUSIC_SEARCH_ENRICH_WAIT_S`（默认 `1.5`）、`FNMUSIC_SEARCH_RANK_WAIT_S`（默认 `1.5`）
+
+### 验收
+
+- 沙箱单元 **188 / 188 PASS**（`patches/_v55_check.py`）；真机端到端 **4 / 4 轮全绿**
+  （搜索 周杰伦 / 稻香 / 空心，首屏有海报占比 21~30/30、top10 恒为「有封面 + 无损」、顺序稳定）。
+- 详见 [`reports/fnmusic-v55-报告.md`](reports/fnmusic-v55-报告.md)。
+
 ## [1.6.0+patch2] - 2026-09-18
 
 ### 修复
