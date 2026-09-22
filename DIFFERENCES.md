@@ -19,6 +19,7 @@
   - [E. 歌词归属](#e-歌词归属)
   - [F. 可观测性](#f-可观测性)
   - [G. 搜索结果排序（有海报 + 高音质优先）](#g-搜索结果排序有海报--高音质优先)
+  - [H. 喜马拉雅有声书音源（v76–v78）](#h-喜马拉雅有声书音源v76v78)
 - [本分支没有改的地方（边界）](#本分支没有改的地方边界)
 - [兼容性与安装](#兼容性与安装)
 - [哪些改动适合直接回馈上游](#哪些改动适合直接回馈上游)
@@ -28,9 +29,9 @@
 
 ## TL;DR：差异量化
 
-| 指标 | 上游 v1.6.0 | 本分支（v55） | 说明 |
+| 指标 | 上游 v1.6.0 | 本分支（v55 / v78） | 说明 |
 |---|---|---|---|
-| 改动文件 | — | **仅 `proxy/app.py`** | 其余文件与上游**逐字节一致** |
+| 改动文件 | — | `proxy/app.py` + `proxy/admin_ui.html` + `docker-compose.yml` + **新增 `xmly-service/`** | v55 阶段只改 `proxy/app.py`；v76 起新增喜马拉雅音源服务 |
 | `app.py` 行数 | 3,080 | 5,849 | +90% |
 | 函数个数 | 117 | 228 | **+111 个新增** |
 | HTTP 路由 | 28 | 29 | **+1**（`/music/api/v1/play-history/delete`） |
@@ -181,6 +182,32 @@
 
 ---
 
+### H. 喜马拉雅有声书音源（v76–v78）
+
+这是本分支**唯一一个上游完全没有的能力**——上游只有音乐音源，没有有声书。
+逐版说明见 [`v76-变更说明.md`](v76-变更说明.md)、[`v77-变更说明.md`](v77-变更说明.md)、
+[`v78-变更说明.md`](v78-变更说明.md)。
+
+| 项 | 上游 v1.6.0 | 本分支 |
+|---|---|---|
+| 有声书 | **无** | 新增 `xmly-service/`（独立容器，宿主 `127.0.0.1:8774`）+ `docker-compose.yml` 里的 `xmly` service |
+| 内容模型 | — | **一个歌单 = 一部小说 = 喜马拉雅的一个专辑**；歌单 guid `online:playlist:xmly:<albumId>`，单集 guid `online:xmly:<trackId>:<albumId>` |
+| 与音乐搜索的关系 | — | **触发词劫持**：`小说 …` / `喜马拉雅 …` / `xmly …` 才走喜马拉雅；不带触发词时与原有链路完全隔离，互不干扰 |
+| 播放取流 | — | `/mobile-playpage/track/v3/baseInfo` 返回加密串 → **AES-128-ECB 解密**得到真实 m4a 直链 |
+| VIP | — | 管理页「音源」→ 🎙️ 喜马拉雅 → **扫码登录**（base64 二维码 + 2s 轮询），cookie 落 `xmly-data/` |
+| 小说海报 | — | v77 修：`coverId` 必须是 `/static/cover` 能解析的 **guid**，不能填外链 URL；`xmcdn.com` 走 `!op_type=3&columns=N&rows=N` 现算缩略图（686 KB → 47 KB → 15 KB） |
+| 管理页搜索 | 「歌单综合搜索」 | 「**综合搜索**」+ 搜索栏左侧「**歌单 / 小说**」分段控件（`kind=playlist` / `kind=novel`） |
+| 歌单曲目分页 | `size=-1`（一次给全）被 `if size < 1: size = 50` 兜成 50 ⇒ **上千集的小说只显示前 50 集** | v78 修：`_page_size()` / `_slice_page()`，`size <= 0` 视为一次给全（`_PAGE_ALL_CAP=5000` 兜底） |
+
+**新增配置**：`FNMUSIC_XMLY_ENABLED`、`FNMUSIC_XMLY_URL`、`FNMUSIC_ADMIN_PORT`
+
+> ★ 两个值得记住的坑：
+> ① `coverId` 必须是 guid，填外链会让 App 的封面请求解析不出音源 ⇒ 海报整块空白；
+> ② `size=-1` 这类「约定值」必须在 `if size < 1: size = 50` 之类的兜底**之前**处理，
+>    否则约定分支会变成永不进入的死代码。
+
+---
+
 ## 本分支没有改的地方（边界）
 
 明确说明**没做什么**，便于你判断风险：
@@ -195,7 +222,10 @@
 
 ## 兼容性与安装
 
-- **安装方式与上游完全一致**：`install.sh` / `extend.sh` / `restore.sh` / `docker-compose.yml` 等一个字节都没改。
+- **安装方式与上游完全一致**：`install.sh` / `extend.sh` / `restore.sh` 等一个字节都没改；
+  `docker-compose.yml` 只**追加**了 `xmly` 一个 service 块，其余未动。
+- **也可以用 docker-compose 部署**：compose 负责 4 个音源服务，核心代理（需接管 Unix Socket）
+  仍由宿主机 systemd 运行。完整步骤见 README 的「方式二：docker-compose 部署」。
 - **新增的 23 个配置项全部有默认值**，`.env` 不填也能跑；想用「只对收藏落盘」「自动扫库」「搜索结果排序」按 `PATCHES.md` 里的清单打开即可。
 - **回滚很简单**：换回上游的 `proxy/app.py` 并重启服务即可（本分支未改数据结构）。
 - 本分支自带 4 份验收报告（[`reports/`](reports/)）与可复现脚本（[`patches/`](patches/)），
