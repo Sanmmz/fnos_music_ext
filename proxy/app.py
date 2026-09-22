@@ -1214,7 +1214,13 @@ async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Re
         content=body if body else None,
     )
     resp = await client.send(req, stream=True)
-    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    # ★ v81 本地音乐播放修复：Content-Length 必须原样透传。
+    #   旧实现把 content-length 一并剔除，于是本地音频（以及所有转发响应）都变成
+    #   `Transfer-Encoding: chunked` 且**没有总长度** —— iOS / 部分安卓播放器
+    #   拿不到总长度会直接播放失败，或能播但无法拖动进度。
+    #   这里是纯透传（body 未被改写，请求已强制 accept-encoding: identity），
+    #   上游给的长度就是真实长度，可以放心保留。
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-encoding"})
 
     async def body_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -1244,7 +1250,8 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
         content=body if body else None,
     )
     resp = await client.send(req)
-    resp_headers = filter_headers(resp.headers, exclude_keys={"content-length", "content-encoding"})
+    # v81：同上，纯透传场景下保留 Content-Length
+    resp_headers = filter_headers(resp.headers, exclude_keys={"content-encoding"})
     if resp.status_code != 200:
         return Response(
             content=resp.content,
@@ -7193,7 +7200,7 @@ ADMIN_GROUPS = [
             {"env": "FNMUSIC_TEE_SAVE_ENABLED", "conf": "tee_save_enabled", "type": "bool",
              "label": "边听边存", "desc": "播放在线歌曲时同时存入飞牛曲库（默认开）。"},
             {"env": "FNMUSIC_TEE_SAVE_DIR", "conf": "tee_save_dir", "type": "text",
-             "label": "边听边存保存路径", "desc": "留空=自动探测飞牛共享曲库；填了以填写为准。"},
+             "label": "下载目录（保存路径）", "desc": "收藏下载 / 边听边存 / 播放下载的音频统一落到这里；留空=自动探测飞牛共享曲库。保存后立即生效。"},
             {"env": "FNMUSIC_TEE_CACHE_MAX", "conf": "tee_cache_max", "type": "int",
              "label": "滚动试听缓存首数", "desc": "仅关闭边听边存时生效：完整试听的最近 N 首滚动缓存。"},
             {"env": "FNMUSIC_TEE_FAVORITES_ONLY", "conf": "tee_favorites_only", "type": "bool",
@@ -7467,6 +7474,92 @@ def _load_admin_ui_html() -> str:
     return _ADMIN_UI_HTML
 
 
+# === v80：设置页「下载目录」实时状态 ===
+# 背景：tee_save_dir() 在目录不可写时会**静默回退**到自动探测的曲库目录，
+# 用户填了路径却不知道没生效。这里把「配置值 / 实际生效值 / 是否回退 / 可写性 /
+# 磁盘余量 / 已有音频」一次性给前端，让设置页能立刻校验。
+# 超过此容量的 statvfs 结果视为不可信（云挂载常见 1PB 假值）
+_SPACE_PLAUSIBLE = 512 * 1024 ** 4
+_AUDIO_EXT = (".mp3", ".flac", ".m4a", ".m4b", ".wav", ".ogg", ".aac", ".ape", ".opus", ".wma")
+
+
+def _admin_storage_info() -> dict:
+    """下载目录落地处境快照（同步、轻量，供管理台「设置」页调用）。"""
+    configured = str(CONF.get("tee_save_dir") or "").strip()
+    try:
+        effective = tee_save_dir()
+    except Exception:  # noqa: BLE001
+        effective = ""
+    info = {
+        "code": 0,
+        "configured": configured,
+        "effective": effective,
+        "detected": "",
+        "exists": False,
+        "writable": False,
+        "fallback": bool(configured and effective
+                         and os.path.abspath(configured) != os.path.abspath(effective)),
+        "free_bytes": 0,
+        "total_bytes": 0,
+        "space_unknown": False,
+        "audio_files": 0,
+        "audio_bytes": 0,
+        "truncated": False,
+        "error": "",
+    }
+    try:
+        info["detected"] = detect_library_dir()
+    except Exception as e:  # noqa: BLE001
+        info["detected"] = ""
+        info["error"] = "detect failed: %s" % e
+    if effective:
+        try:
+            info["exists"] = os.path.isdir(effective)
+            info["writable"] = os.access(effective, os.W_OK)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # ★ rclone / WebDAV 等云挂载会把容量报成 1PB 且完全无已用，
+            #   这种数字显示出来只会误导；超过 512TB 或 free>total 一律标记为未知。
+            st = os.statvfs(effective)
+            _total = int(st.f_blocks) * int(st.f_frsize)
+            _free = int(st.f_bavail) * int(st.f_frsize)
+            if 0 < _total <= _SPACE_PLAUSIBLE and _free <= _total:
+                info["free_bytes"], info["total_bytes"] = _free, _total
+            else:
+                info["space_unknown"] = True
+        except Exception as e:  # noqa: BLE001
+            info["space_unknown"] = True
+            info["error"] = "statvfs failed: %s" % e
+        try:
+            n = b = 0
+            with os.scandir(effective) as it:
+                for e in it:
+                    try:
+                        if not e.is_file():
+                            continue
+                        if not str(e.name).lower().endswith(_AUDIO_EXT):
+                            continue
+                        n += 1
+                        b += int(e.stat().st_size)
+                        if n >= 9999:
+                            info["truncated"] = True
+                            break
+                    except Exception:  # noqa: BLE001
+                        continue
+            info["audio_files"], info["audio_bytes"] = n, b
+        except Exception as e:  # noqa: BLE001
+            info["error"] = "scan failed: %s" % e
+    return info
+
+
+async def admin_storage_get(request: Request):
+    auth_err = _check_admin_auth(request)
+    if auth_err is not None:
+        return auth_err
+    return JSONResponse(content=_admin_storage_info())
+
+
 async def admin_page(request: Request):
     return HTMLResponse(content=_load_admin_ui_html(), status_code=200)
 
@@ -7609,6 +7702,7 @@ for _NB in ("/music/api/v1/admin", "/music/api/v1/_ext/admin", "/_ext/admin"):
     app.add_api_route(_NB + "/api/playlists", admin_playlists_post, methods=["POST"])
     app.add_api_route(_NB + "/api/playlists/search", admin_playlists_search_get, methods=["GET"])
     app.add_api_route(_NB + "/api/playlists/dims", admin_playlists_dims_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/settings/storage", admin_storage_get, methods=["GET"])
 
 
 # === 管理控制台独立 TCP 端口（绕过 fnOS Nginx，局域网直连）===
@@ -7832,13 +7926,16 @@ async def _xmly_search_albums(keyword: str, limit: int = 20) -> list[dict]:
     return [a for a in arr if isinstance(a, dict) and a.get("albumId")]
 
 
-async def _xmly_album_rows(album_id, max_pages: int = 60, cache_only_first_page: bool = False) -> list[dict]:
+async def _xmly_album_rows(album_id, max_pages: int = 0, cache_only_first_page: bool = False) -> list[dict]:
     """取专辑声音（带 15 分钟缓存）。命中缓存 0 请求。
 
     ★ max_pages 很关键：一部小说动辄上千集（每页 30 条）。搜索结果只需要第一集来
       「代表这部小说」，如果这里拉满会把一次搜索变成几十次 HTTP。
       完整的章节拉取只发生在用户真正点开歌单时（playlist_track_list）。
       ★ cache_only_first_page：只写第一页进缓存时不要污染整张专辑的缓存。
+      ★ v79：**max_pages <= 0 = 不限制，交给 xmly-service 按 trackTotalCount 自动算页数**。
+        以前默认值写死 60 ⇒ 60*30 = 1800 集封顶，《诡秘之主》2070 集被砍成 1800 集
+        （歌单里落盘的 track_count 也跟着停在 1800）。
     """
     aid = str(album_id or "").strip()
     if not aid:
@@ -7847,11 +7944,14 @@ async def _xmly_album_rows(album_id, max_pages: int = 60, cache_only_first_page:
     if cache and time.time() - float(cache.get("ts") or 0) < _XMLY_CACHE_TTL:
         rows = list(cache.get("rows") or [])
         # 缓存完整时按页切片返回，避免「只想要第一页」的场景白传一大坨数据
-        if max_pages != 60:
+        if max_pages and max_pages > 0:
             return rows[: max_pages * 30]
         return rows
-    j = await _xmly_aget("/api/v1/album/tracks",
-                         {"albumId": aid, "max_pages": max(1, int(max_pages))}, timeout=90.0)
+    params = {"albumId": aid}
+    if max_pages and max_pages > 0:
+        # 显式上限时才传；不传 = 服务端按 trackTotalCount 自动算
+        params["max_pages"] = max(1, int(max_pages))
+    j = await _xmly_aget("/api/v1/album/tracks", params, timeout=120.0)
     rows = [r for r in (j.get("tracks") or []) if isinstance(r, dict) and r.get("trackId")]
     if rows:
         if rows and not cache_only_first_page:
@@ -8492,8 +8592,12 @@ def _admin_playlists_payload() -> dict:
     current = [
         {"id": "daily", "builtin": True, "source": "netease", "source_id": "", "name": "每日推荐",
          "enabled": daily_enabled, "track_count": 0, "env": None,
-         "desc": "每日生成推荐歌单；模式：%s；LLM 兜底：%s。" % (daily_mode, "开" if llm_on else "关"),
-         "mode": daily_mode, "llm": ("enabled" if llm_on else "disabled")},
+         # v82：手机上这行描述会因中英混排 + 全角分号换行得很怪，改成纯中文短句
+         "desc": ("每日自动生成的推荐歌单，曲目由 AI 挑选。" if daily_mode == "llm-fallback"
+                  else "每日自动生成的推荐歌单，曲目取自各音源榜单。"),
+         "mode": daily_mode,
+         "mode_label": ("AI 兜底" if daily_mode == "llm-fallback" else "榜单直取"),
+         "llm": ("enabled" if llm_on else "disabled")},
     ]
     # 自愈：历史记录若 track_count 为 0（旧版本未在加入时计算），这里补算一次并落盘，
     # 避免「已加入但显示 0 首」让人误以为歌单是空的。
@@ -8687,6 +8791,14 @@ class _AdminHTTPHandler(_AdminBaseHandler):
                        "needs_restart": _ADMIN_PENDING_RESTART, "auth": bool(_admin_token()),
                        "restart_required_keys": [it["env"] for it in SCHEMA_INDEX.values() if it.get("restart")]}
             self._send(200, _ajson.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/settings/storage":
+            if not _admin_auth_ok(self.headers, self._qs()):
+                self._send(401, _ajson.dumps({"code": 401, "msg": "unauthorized"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            self._send(200, _ajson.dumps(_admin_storage_info(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
             return
         if path == "/admin/api/sources":

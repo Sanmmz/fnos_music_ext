@@ -543,44 +543,93 @@ async def album_detail(albumId: int = Query(0)):
     }}
 
 
+# v79：页数不再写死 60 —— 《诡秘之主》2070 集需要 69 页，60 页上限直接砍掉 270 集
+# （歌单里存下来的 track_count 就停在 1800 = 60*30）。现在按 trackTotalCount 算页数，
+# 并且第 2 页起并发抓：串行 69 页 9.9s，并发 8 只要 1.7s（实测不触发风控）。
+_TRACK_PAGE_SIZE = 30
+_TRACK_MAX_PAGES = int(os.environ.get("XMLY_TRACK_MAX_PAGES", "200"))      # 200*30 = 6000 集
+_TRACK_CONCURRENCY = max(1, int(os.environ.get("XMLY_TRACK_CONCURRENCY", "8")))
+
+
+async def _fetch_tracks_page(aid: int, pn: int, sort: int, hd: dict, sem):
+    """抓单页；失败或非 200 一律返回 (pn, None)，由调用方决定怎么兜底。"""
+    async with sem:
+        for attempt in (1, 2):
+            j = None
+            try:
+                r = await _cli().get(WEB + "/revision/album/getTracksList",
+                                     params={"albumId": aid, "pageNum": pn, "sort": sort},
+                                     headers=hd, timeout=25.0)
+                j = r.json()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("album tracks page failed aid=%s page=%d try=%d: %s",
+                               aid, pn, attempt, e)
+            if isinstance(j, dict) and j.get("ret") == 200:
+                return pn, j
+            if attempt == 2:
+                logger.info("album tracks stop aid=%s page=%d ret=%s",
+                            aid, pn, (j or {}).get("ret") if isinstance(j, dict) else "exc")
+                return pn, None
+            await asyncio.sleep(0.4)
+    return pn, None
+
+
 @app.get("/api/v1/album/tracks")
 async def album_tracks(albumId: int = Query(0), sort: int = Query(0),
-                       max_pages: int = Query(60)):
+                       max_pages: int = Query(0)):
     """专辑的全部声音（= 小说的全部章节）。
 
     ★ 唯一实测能匿名拉满的接口：GET /revision/album/getTracksList?albumId=&pageNum=N
       - 每页固定 30 条（传 pageSize 无效），翻到空为止
-      - 实测 1024 集专辑可以完整拉到 1024 条（35 页）
-      - 注意路径是 `/revision/album/getTracksList`，
-        **不是** `/revision/album/v1/getTracksList`（v1 版要 webtk cookie）
+      - 路径是 `/revision/album/getTracksList`，**不是** `/revision/album/v1/getTracksList`
+        （v1 版要 webtk cookie）
+
+    ★ v79 两条关键改动（修《诡秘之主》2070 集只出 1800 集）：
+      1. **页数按 trackTotalCount 算**，不再写死 60。`max_pages <= 0` = 自动；
+         `> 0` = 显式上限（仍受 `XMLY_TRACK_MAX_PAGES` 硬顶保护）。
+      2. **第 2 页起并发抓**（默认 8 并发）。2070 集：串行 9.9s → 并发 1.7s。
+         结果仍按 pageNum 升序拼装保证章节顺序，遇到空页 / 失败页即停。
     """
     aid = int(albumId or 0)
     if aid <= 0:
         return JSONResponse({"ok": False, "msg": "albumId required"}, status_code=400)
     hd = {"User-Agent": UA_WEB, "Referer": "{}/album/{}".format(WEB, aid)}
-    tracks: list[dict] = []
-    total = 0
+
+    # ---- 第 1 页：拿 trackTotalCount，据此决定要翻多少页 ----
+    _, j1 = await _fetch_tracks_page(aid, 1, sort, hd, asyncio.Semaphore(1))
+    if j1 is None:
+        logger.warning("album tracks aid=%s first page failed", aid)
+        return {"ok": True, "tracks": [], "total": 0}
+    d1 = j1.get("data") or {}
+    total = int(d1.get("trackTotalCount") or 0)
+    if total:
+        need = -(-total // _TRACK_PAGE_SIZE) + 1     # 多翻 1 页确认结束
+    else:
+        need = 60                                     # 拿不到总数时退化为旧行为
     try:
-        pages = max(1, min(int(max_pages or 60), 100))
+        _cap = int(max_pages or 0)
     except (TypeError, ValueError):
-        pages = 60
+        _cap = 0
+    if _cap > 0:
+        need = min(need, _cap)
+    need = max(1, min(need, _TRACK_MAX_PAGES))
+
+    pages: dict[int, dict] = {1: j1}
+    if need > 1:
+        sem = asyncio.Semaphore(_TRACK_CONCURRENCY)
+        got = await asyncio.gather(*[_fetch_tracks_page(aid, pn, sort, hd, sem)
+                                     for pn in range(2, need + 1)])
+        for pn, j in got:
+            if j is not None:
+                pages[pn] = j
+
+    tracks: list[dict] = []
     cover_cache = ""
-    for pn in range(1, pages + 1):
-        try:
-            r = await _cli().get(WEB + "/revision/album/getTracksList",
-                                 params={"albumId": aid, "pageNum": pn, "sort": sort},
-                                 headers=hd, timeout=20.0)
-            j = r.json()
-        except Exception as e:
-            logger.warning("album tracks failed aid=%s page=%d: %s", aid, pn, e)
-            break
-        if j.get("ret") != 200:
-            logger.info("tracks stop aid=%s page=%d ret=%s msg=%s",
-                        aid, pn, j.get("ret"), j.get("msg"))
+    for pn in range(1, need + 1):
+        j = pages.get(pn)
+        if j is None:
             break
         d = j.get("data") or {}
-        if not total:
-            total = int(d.get("trackTotalCount") or 0)
         lst = d.get("tracks") or []
         if not lst:
             break
@@ -608,7 +657,8 @@ async def album_tracks(albumId: int = Query(0), sort: int = Query(0),
             })
         if total and len(tracks) >= total:
             break
-    logger.info("album tracks aid=%s -> n=%d total=%d", aid, len(tracks), total)
+    logger.info("album tracks aid=%s -> n=%d total=%d pages=%d",
+                aid, len(tracks), total, need)
     return {"ok": True, "tracks": tracks, "total": total or len(tracks)}
 
 

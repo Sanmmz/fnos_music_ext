@@ -51,6 +51,9 @@
   .page-head{margin-bottom:14px;flex:0 0 auto}
   .page-head h1{margin:0 0 4px;font-size:21px}
   .page-head p{margin:0;color:var(--muted)}
+  /* v82：音源页下方新增「音源总开关」面板，窗口很矮时让整块内容可滚动，
+     否则 .content 是 100vh + overflow:hidden，面板会被裁掉看不见。 */
+  .content{overflow-y:auto}
   .source-layout{display:flex;gap:22px;align-items:stretch;flex:1;min-height:0}
   /* 音源竖向列表（可排序） */
   .src-col{width:300px;flex:0 0 300px;display:flex;flex-direction:column;gap:10px;
@@ -180,6 +183,9 @@
   .pl-manage-row .mst,.pl-src-row .mst{font-size:11px;color:var(--muted);margin-top:1px}
   .pl-manage-row .del{flex:0 0 auto;color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
   .pl-manage-row .del:hover{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad);border-color:var(--bad)}
+  /* v82：行尾操作区包一层 .mact —— 手机端才能整体换到第二行，
+     否则「把手+图标+名称描述+开关/按钮」挤在一行，文字会被压成一条细缝。 */
+  .pl-manage-row .mact,.pl-src-row .mact{display:flex;align-items:center;gap:8px;flex:0 0 auto}
   /* 网易云登录区 */
   .ne-body{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;margin-top:6px}
   .qr-wrap{background:#fff;border-radius:12px;padding:14px;display:flex;flex-direction:column;align-items:center;gap:10px;
@@ -203,6 +209,20 @@
   .slider:before{content:"";position:absolute;height:19px;width:19px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
   .switch input:checked + .slider{background:var(--brand)}
   .switch input:checked + .slider:before{transform:translateX(21px)}
+  /* v80 设置页输入控件 */
+  /* v81：.content 是 overflow:hidden 的 flex 列，设置页有 6 个分组会超出视口
+     且滚不到底 —— 给设置页单独套一层可滚动容器（与音源/歌单页的 .src-col 同款做法） */
+  .set-wrap{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
+  .set-hd{cursor:pointer;user-select:none}
+  .set-hd:hover .ttl{color:var(--brand)}
+  .cfg-row{display:flex;align-items:center;gap:8px;justify-content:flex-end;flex:0 0 auto}
+  .cfg-in{padding:9px 11px;border-radius:9px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font-size:14px;width:260px;max-width:100%;box-sizing:border-box}
+  .cfg-in:focus{outline:none;border-color:var(--brand)}
+  select.cfg-in{width:auto;min-width:170px}
+  .cfg-unit{font-size:12px;color:var(--muted);white-space:nowrap}
+  .row.srow{align-items:flex-start}
+  .row.srow>.switch{margin-top:2px}
   .btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:8px 15px;border-radius:9px;
     cursor:pointer;font-size:13px;font-weight:600;transition:.15s}
   .btn:hover{border-color:var(--brand);color:var(--brand)}
@@ -268,6 +288,14 @@
     .src-row{min-height:52px;padding:14px}
     .btn{min-height:40px;padding:10px 15px;font-size:14px}
     .pl-src-row,.pl-manage-row{min-height:58px}
+    /* v82：窄屏下让操作区整体换到第二行右对齐，名称与描述占满整行。 */
+    .pl-src-row,.pl-manage-row{flex-wrap:wrap;align-items:center;row-gap:10px}
+    .pl-manage-row .mmeta,.pl-src-row .mmeta{flex:1 1 200px;min-width:0}
+    .pl-manage-row .mact,.pl-src-row .mact{margin-left:auto;justify-content:flex-end;flex-wrap:wrap}
+    /* v82：描述允许正常换行并按任意位置断行，避免长句把行撑变形 */
+    .pl-manage-row .mst,.pl-src-row .mst{white-space:normal;line-height:1.45;
+      overflow-wrap:anywhere;word-break:break-word}
+    .pl-manage-row .mact .btn,.pl-src-row .mact .btn{min-height:40px}
     /* 拖动手柄：触控目标需 ≥44px，手机上加宽（桌面仍是细手柄） */
     .dh{flex:0 0 44px;min-height:44px;padding:0;font-size:17px;background:var(--panel2);
       border:1px solid var(--border)}
@@ -294,6 +322,13 @@
   @media(max-width:380px){
     .content{padding:12px 10px calc(104px + env(safe-area-inset-bottom))}
     .pl-src-row .btn,.pl-manage-row .btn{padding:8px 10px;font-size:13px}
+    /* v80：设置页长输入框 / 下拉在窄屏下独占一行 */
+    .row.srow{flex-direction:column;align-items:stretch;gap:9px}
+    .row.srow>.switch{align-self:flex-end}
+    .cfg-row{justify-content:stretch}
+    .cfg-in,select.cfg-in{width:100%;min-width:0;min-height:44px}
+    /* 手机端整页滚动，设置页容器不要再自己滚 */
+    .set-wrap{overflow:visible}
   }
 </style>
 </head>
@@ -308,6 +343,7 @@
     <div class="nav">
       <div class="nav-item active" id="nav-source" onclick="setView('source')"><span class="ic">🎚️</span><span>音源</span></div>
       <div class="nav-item" id="nav-playlist" onclick="setView('playlist')"><span class="ic">📋</span><span>歌单</span></div>
+      <div class="nav-item" id="nav-settings" onclick="setView('settings')"><span class="ic">⚙️</span><span>设置</span></div>
     </div>
     <div class="foot">
       <span class="dot" id="foot-dot"></span><span id="foot-txt">连接中…</span>
@@ -352,7 +388,8 @@ const SORTABLE_KEYS = SOURCES.filter(s=>s.sortable).map(s=>s.key);
 
 let STATE = { view:"source", sources:null, playlists:null, order:null, selected:null, qr:null, poll:null, plSel:null, plFilter:"", plSearch:{q:"", kind:"playlist", results:null, loading:false, msg:""},
   xmlyQr:null,
-  gen:{ dims:null, sizes:[20,30,40,60], region:[], mood:[], language:"any", size:40, result:null, loading:false, msg:"" } };
+  gen:{ dims:null, sizes:[20,30,40,60], region:[], mood:[], language:"any", size:40, result:null, loading:false, msg:"" },
+  settings:null, storage:null };
 
 document.getElementById("tokenOk").onclick = ()=>{
   setToken(document.getElementById("tokenInput").value.trim());
@@ -377,12 +414,20 @@ async function loadAll(){
     if(!STATE.gen.dims){ try{ const rd=await api("/admin/api/playlists/dims"); const d=await rd.json();
       if(d && d.code===0){ STATE.gen.dims=d.dims||[]; STATE.gen.sizes=d.sizes||[20,30,40,60]; STATE.gen.size=d.default_size||40; } }catch(e){} }
   }
+  if(STATE.view==="settings"){
+    try{ const rs=await api("/admin/api/config"); const ds=await rs.json();
+      STATE.settings=(ds&&ds.code===0)?ds:{code:1,error:String((ds&&ds.msg)||"读取失败")}; }catch(e){ STATE.settings={code:1,error:String(e)}; }
+    try{ const rt=await api("/admin/api/settings/storage"); STATE.storage=await rt.json(); }
+      catch(e){ STATE.storage={code:1,error:String(e)}; }
+  }
   render(); updateFoot();
 }
 function setView(v){ stopPoll(); STATE.view=v; STATE.selected=null; STATE.qr=null; STATE.plSel=null;
   document.getElementById("nav-source").className="nav-item"+(v==="source"?" active":"");
   document.getElementById("nav-playlist").className="nav-item"+(v==="playlist"?" active":"");
+  document.getElementById("nav-settings").className="nav-item"+(v==="settings"?" active":"");
   if(v==="playlist" && !STATE.playlists){ loadAll(); return; }
+  if(v==="settings" && !STATE.settings){ loadAll(); return; }
   render();
 }
 function srcData(k){ return STATE.sources ? STATE.sources[k] : null; }
@@ -402,9 +447,28 @@ function statusOf(k){
 }
 
 /* ============ 渲染 ============ */
+/* v82：整块 innerHTML 重绘会把滚动位置打回顶部（设置页点「展开」最明显），
+   重绘前后把「窗口滚动 + 页面内滚动容器」的位置原样存回。 */
+function captureScroll(){
+  const w=document.getElementById("setWrap"), d=document.getElementById("detailCol"),
+        c=document.getElementById("content");
+  return { w: w?w.scrollTop:0, d: d?d.scrollTop:0, c: c?c.scrollTop:0,
+           y: (window.pageYOffset!=null?window.pageYOffset:(document.documentElement.scrollTop||0)) };
+}
+function restoreScroll(k){
+  if(!k) return;
+  const w=document.getElementById("setWrap"), d=document.getElementById("detailCol"),
+        c=document.getElementById("content");
+  if(w) w.scrollTop=k.w;
+  if(d && k.d) d.scrollTop=k.d;
+  if(c && k.c) c.scrollTop=k.c;
+  try{ window.scrollTo(0, k.y); }catch(e){}
+}
 function render(){
-  if(STATE.view==="playlist") return renderPlaylists();
-  renderSources();
+  const _k = captureScroll();
+  if(STATE.view==="playlist"){ renderPlaylists(); restoreScroll(_k); return; }
+  if(STATE.view==="settings") renderSettings(); else renderSources();
+  restoreScroll(_k);
 }
 function renderSources(){
   const c = document.getElementById("content");
@@ -434,7 +498,8 @@ function renderSources(){
         <div class="order-hint">搜索按此顺序优先调用，结果也优先置顶。</div>
       </div>
       <div class="detail-col" id="detailCol">${renderDetail()}</div>
-    </div>`;
+    </div>
+    ${renderSourceSwitches()}`;
   initDragSort(document.getElementById("srcCol"), {
     itemSel: ".src-row[data-sortable='1']",
     getKey: el => el.getAttribute("data-key"),
@@ -460,6 +525,28 @@ async function saveOrder(){
   }catch(e){ toast("保存顺序失败: "+(e.message||e),"err"); }
 }
 
+/* v82「音源总开关」：原在设置页的 4 个音源开关与音源页逐个开关重复，
+   收到音源页做一屏总览（同一个 env，两处开关实时一致）。 */
+function renderSourceSwitches(){
+  const s = STATE.sources; if(!s || s.code!==0) return "";
+  const rows = SOURCES.map(o=>{
+    const d = srcData(o.key) || {};
+    const st = statusOf(o.key);
+    return `<div class="row srow">
+      <div class="lab">${esc(o.name)}<div class="sub">${o.key==="xmly"?"小说等有声书专用，不参与常规歌曲搜索":"可用于在线搜索与取流"} · 当前：${esc(st.txt)}</div></div>
+      <label class="switch" title="启用 / 停用">
+        <input type="checkbox" data-env="${o.env}" ${d.enabled?"checked":""} onchange="toggleSrc(this)">
+        <span class="slider"></span>
+      </label>
+    </div>`;
+  }).join("");
+  return `<div class="panel" style="margin-top:16px;flex:0 0 auto">
+    <div class="ph"><div class="ttl"><span class="em">🎺</span><span>音源总开关</span></div>${badge("ok","与上方各音源页一致")}</div>
+    <div class="desc">在这里一次性开启 / 关闭全部音源；单个音源的详细配置（扫码登录、连接状态）点上方列表进入。
+      搜索优先顺序由上方列表右侧 <b>⋮⋮</b> 拖动决定，会自动保存。</div>
+    ${rows}
+  </div>`;
+}
 function renderDetail(){
   const k = STATE.selected;
   if(k==="netease") return renderNeteaseDetail();
@@ -639,6 +726,164 @@ async function toggleSrc(box){
   finally{ box.disabled=false; }
 }
 
+/* ============ 设置（v80，完全由后端 /admin/api/config 的 schema 驱动） ============ */
+const GROUP_ORDER = ["download","playlist","lyric","search","stream","system"];
+const ITEM_ORDER = ["FNMUSIC_FAV_DL_ON_FAVORITE","FNMUSIC_FAV_DELETE_ON_UNFAV","FNMUSIC_FAV_DL_ON_PLAY",
+                    "FNMUSIC_TEE_SAVE_ENABLED","FNMUSIC_TEE_SAVE_DIR"];
+function humanBytes(n){ n=Number(n)||0; const u=["B","KB","MB","GB","TB"]; let i=0;
+  while(n>=1024 && i<u.length-1){ n/=1024; i++; } return (i?n.toFixed(1):String(Math.round(n)))+" "+u[i]; }
+async function loadSettings(){
+  if(!STATE.settingsOpen) STATE.settingsOpen={download:true};
+  try{ const rs=await api("/admin/api/config"); const ds=await rs.json();
+    STATE.settings=(ds&&ds.code===0)?ds:{code:1,error:String((ds&&ds.msg)||"读取失败")}; }
+  catch(e){ STATE.settings={code:1,error:String(e)}; }
+  try{ const rt=await api("/admin/api/settings/storage"); STATE.storage=await rt.json(); }
+  catch(e){ STATE.storage={code:1,error:String(e)}; }
+  render();
+}
+/* v82：与其他页面重复的配置项不再出现在设置页 ——
+   · playlist 组（4 个音源开关）→ 音源页「音源总开关」
+   · FNMUSIC_SOURCE_ORDER（音源优先顺序）→ 音源页拖动排序自动写入 */
+const SETTINGS_HIDDEN_GROUPS = ["playlist"];
+const SETTINGS_HIDDEN_ITEMS  = ["FNMUSIC_SOURCE_ORDER"];
+function cfgGroups(){
+  const s=STATE.settings; if(!s||s.code!==0) return [];
+  return (s.schema||[]).slice()
+    .filter(g=>SETTINGS_HIDDEN_GROUPS.indexOf(g.id)<0)
+    .sort((a,b)=>GROUP_ORDER.indexOf(a.id)-GROUP_ORDER.indexOf(b.id))
+    .map(g=>Object.assign({},g,{items:(g.items||[]).slice()
+      .filter(it=>SETTINGS_HIDDEN_ITEMS.indexOf(it.env)<0)
+      .sort((a,b)=>{
+      const ia=ITEM_ORDER.indexOf(a.env), ib=ITEM_ORDER.indexOf(b.env);
+      return (ia<0?999:ia)-(ib<0?999:ib); })}))
+    .filter(g=>(g.items||[]).length>0);
+}
+function cfgVal(env){ const s=STATE.settings; return (s&&s.values)?s.values[env]:""; }
+function isRestart(env){ const s=STATE.settings; return !!(s&&(s.restart_required_keys||[]).indexOf(env)>=0); }
+async function saveCfg(env, val, opt){
+  opt = opt || {};
+  try{
+    const r = await api("/admin/api/config", {method:"PUT", body: JSON.stringify({changes:{[env]: String(val)}})});
+    const d = await r.json();
+    if(!d || d.code!==0) throw new Error((d&&d.msg)||"保存失败");
+    if(d.values && STATE.settings) STATE.settings.values = d.values;
+    if(STATE.settings) STATE.settings.needs_restart = d.needs_restart;
+    toast("已保存" + (isRestart(env) ? "（需重启生效）" : ""));
+    if(opt.reload!==false){ await loadSettings(); }
+    return true;
+  }catch(e){
+    toast("保存失败: " + ((e&&e.message)||e), "err");
+    if(opt.revert) opt.revert();
+    return false;
+  }
+}
+async function toggleCfg(box){
+  const env=box.getAttribute("data-env"), on=box.checked; box.disabled=true;
+  const ok = await saveCfg(env, on?"true":"false", {reload:false, revert:()=>{box.checked=!on;}});
+  box.disabled=false; await loadSettings();
+  if(!ok) render();
+}
+async function saveInput(env){
+  const el=document.getElementById("cfg-"+env); if(!el) return;
+  const v=String(el.value==null?"":el.value).trim(); el.disabled=true;
+  await saveCfg(env, v, {reload:false}); el.disabled=false; await loadSettings();
+}
+async function useDetectedDir(){
+  const st=STATE.storage||{}; if(!st.detected) { toast("未能探测到曲库目录","err"); return; }
+  await saveCfg("FNMUSIC_TEE_SAVE_DIR", st.detected, {reload:false}); await loadSettings();
+}
+async function clearDirCfg(){
+  await saveCfg("FNMUSIC_TEE_SAVE_DIR", "", {reload:false}); await loadSettings();
+}
+async function doRestart(){
+  if(!confirm("确定立即重启 fnmusic-ext 服务？音乐服务会中断几秒。")) return;
+  try{ await api("/admin/api/restart", {method:"POST"}); toast("正在重启…"); setTimeout(()=>location.reload(), 7000); }
+  catch(e){ toast("重启失败: "+e, "err"); }
+}
+function storageCard(){
+  const st=STATE.storage||{};
+  const cls = !st.exists ? "bad" : (st.writable ? "ok" : "bad");
+  const txt = !st.exists ? "目录不存在" : (st.writable ? "可写" : "不可写");
+  let line1 = st.configured
+    ? `<div class="row srow"><div class="lab">已配置路径<div class="sub">${esc(st.configured)}${st.fallback?'<br><span style=\'color:var(--warn)\'>该路径不可写或无法创建，已静默回退到当前生效目录</span>':''}</div></div>
+        <div class="cfg-row"><button class="btn" onclick="clearDirCfg()">改为自动探测</button></div></div>`
+    : `<div class="row srow"><div class="lab">未指定路径<div class="sub">留空时自动使用飞牛共享曲库：<b>${esc(st.detected||"—")}</b></div></div>
+        <div class="cfg-row"><button class="btn" onclick="useDetectedDir()">填入探测到的曲库</button></div></div>`;
+  return `<div class="ph" style="margin-bottom:6px"><div class="ttl"><span class="em">💾</span><span>下载目录</span></div><span class="badge ${cls}">${txt}</span></div>
+    <div class="desc" style="margin:2px 0 10px">收藏下载 / 边听边存 / 播放下载的音频都落到下列目录；改完立即生效，不需要重启。</div>
+    <div class="row srow"><div class="lab">当前生效目录<div class="sub">${esc(st.effective||"—")}</div></div>
+      <div style="font-size:12px;color:var(--muted);text-align:right;white-space:nowrap">${st.space_unknown?'可用空间未知（网络盘 / 云挂载）':'可用 '+esc(humanBytes(st.free_bytes))+' / 共 '+esc(humanBytes(st.total_bytes))}</div></div>
+    ${line1}
+    <div class="row srow"><div class="lab">目录内音频<div class="sub">${st.audio_files||0} 个文件，共 ${esc(humanBytes(st.audio_bytes))}${st.truncated?'（超过 9999，仅统计到此）':''}</div></div></div>`;
+}
+function renderCfgItem(it){
+  const v = cfgVal(it.env);
+  const rs = isRestart(it.env);
+  const lab = `<div class="lab">${esc(it.label)}${rs?' <span class="badge warn" style="font-size:10px;padding:1px 7px">重启生效</span>':''}<div class="sub">${esc(it.desc||"")}</div></div>`;
+  const cid = "cfg-"+it.env;
+  let ctl = "";
+  if(it.type==="bool"){
+    ctl = `<label class="switch"><input type="checkbox" data-env="${it.env}" ${String(v)==="true"?"checked":""} onchange="toggleCfg(this)"><span class="slider"></span></label>`;
+  }else if(it.type==="enum"){
+    ctl = `<div class="cfg-row"><select id="${cid}" class="cfg-in" onchange="saveInputFromSelect('${it.env}', this.value)">` +
+          (it.options||[]).map(o=>`<option value="${esc(o)}" ${String(v)===String(o)?"selected":""}>${esc(o)}</option>`).join("") +
+          `</select></div>`;
+  }else if(it.type==="secret"){
+    ctl = `<div class="cfg-row"><input id="${cid}" class="cfg-in" type="password" value="${esc(v==="***"?"":v)}" placeholder="留空表示不启用"
+      onkeydown="if(event.key==='Enter')saveInput('${it.env}')"><button class="btn" onclick="saveInput('${it.env}')">保存</button></div>`;
+  }else{
+    const num = (it.type==="int"||it.type==="float"||it.type==="mbytes");
+    const ph = it.type==="mbytes" ? "单位 MB，0=不限" : (num ? "0" : "留空=自动");
+    ctl = `<div class="cfg-row"><input id="${cid}" class="cfg-in" type="${num?"number":"text"}" value="${esc(v)}" placeholder="${ph}"
+      onkeydown="if(event.key==='Enter')saveInput('${it.env}')"><button class="btn" onclick="saveInput('${it.env}')">保存</button>${it.type==="mbytes"?'<span class="cfg-unit">MB</span>':''}</div>`;
+  }
+  return `<div class="row srow">${lab}${ctl}</div>`;
+}
+async function saveInputFromSelect(env, val){
+  const el=document.getElementById("cfg-"+env); if(el) el.disabled=true;
+  await saveCfg(env, val, {reload:false});
+  if(el) el.disabled=false;
+  await loadSettings();
+}
+function renderCfgGroup(g){
+  const open = !!(STATE.settingsOpen && STATE.settingsOpen[g.id]);
+  const n = (g.items||[]).length;
+  return `<div class="panel" style="margin-bottom:16px">
+    <div class="ph set-hd" style="margin-bottom:${open?"10px":"2px"}" onclick="toggleGroup('${g.id}')">
+      <div class="ttl"><span class="em">${esc(g.icon||"⚙")}</span><span>${esc(g.title)}</span>
+        <span class="badge off">${n} 项</span></div>
+      <span class="cfg-unit">${open?"收起 ▲":"展开 ▼"}</span>
+    </div>
+    <div class="desc" style="margin:2px 0 ${open?"6px":"0"}">${esc(g.desc||"")}</div>
+    ${open?(g.items||[]).map(renderCfgItem).join(""):""}
+  </div>`;
+}
+function toggleGroup(id){
+  if(!STATE.settingsOpen) STATE.settingsOpen={};
+  STATE.settingsOpen[id]=!STATE.settingsOpen[id];
+  render();
+}
+function renderSettings(){
+  const c=document.getElementById("content");
+  const s=STATE.settings;
+  if(!s||s.code!==0){
+    c.innerHTML=`<div class="page-head"><h1>设置</h1></div>
+      <div class="empty">加载失败：${esc((s&&s.error)||"未知")} <button class="btn" onclick="loadSettings()">重试</button></div>`;
+    return;
+  }
+  let html=`<div class="page-head"><h1>设置</h1>
+    <p>音源开关、音源优先顺序已合并到「音源」页；下载落盘相关设置在下方「下载管理」。</p></div>`;
+  if(s.needs_restart){
+    html+=`<div class="empty" style="padding:14px 18px;text-align:left;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <span>有配置项需要重启服务后才生效。</span><button class="btn primary" onclick="doRestart()">立即重启</button></div>`;
+  }
+  html+=`<div class="set-wrap" id="setWrap">`;
+  html+=`<div class="panel" style="margin-bottom:16px">${storageCard()}</div>`;
+  html+=cfgGroups().map(renderCfgGroup).join("");
+  html+=`</div>`;
+  c.innerHTML=html;
+}
+
 /* ============ 歌单（分组 Master-Detail） ============ */
 function srcEmoji(k){ return {netease:"🎶",kuwo:"🎵",migu:"🎤",lx:"🎧",musicdl:"🐱",ai:"✨",custom:"🎛️",xmly:"🎙️"}[k] || "🎵"; }
 function srcName(k){ return {netease:"网易云音乐",kuwo:"酷我音乐",migu:"咪咕音乐",lx:"洛雪音乐",musicdl:"音乐猫",ai:"AI 智能组装",custom:"自定义生成",xmly:"喜马拉雅"}[k] || k; }
@@ -752,8 +997,8 @@ function renderSearchResults(st){
       <div class="mic">${srcEmoji(r.source)}</div>
       <div class="mmeta"><div class="mnm">${esc(r.name)}</div><div class="mst">${sub}</div>
         ${isNovel && r.intro ? `<div class="mst" style="opacity:.75">${esc(String(r.intro).slice(0,90))}</div>`:""}</div>
-      <button class="btn${added?"":" primary"}" ${added?"disabled":""}
-        onclick="addToCur('${r.source}','${esc(String(r.id))}','${esc(r.name)}','${esc(String(r.cover||""))}')">${added?"已加入":"加入当前歌单"}</button>
+      <div class="mact"><button class="btn${added?"":" primary"}" ${added?"disabled":""}
+        onclick="addToCur('${r.source}','${esc(String(r.id))}','${esc(r.name)}','${esc(String(r.cover||""))}')">${added?"已加入":"加入当前歌单"}</button></div>
     </div>`;
   }).join("");
 }
@@ -914,7 +1159,7 @@ function renderCurrentGroup(){
     const ctrl = builtin
       ? (pl.env
         ? `<label class="switch" title="启用 / 停用"><input type="checkbox" data-env="${esc(pl.env)}" ${enabled?"checked":""} onchange="toggleSrc(this)"><span class="slider"></span></label>`
-        : `<span class="meta">${pl.mode?("模式 "+esc(pl.mode)):"常驻"}</span>`)
+        : `<span class="meta">${pl.mode_label?("模式 "+esc(pl.mode_label)):"常驻"}</span>`)
       : `<label class="switch" title="启用 / 停用"><input type="checkbox" data-id="${esc(pl.id)}" ${enabled?"checked":""} onchange="toggleCur(this)"><span class="slider"></span></label>`;
     const right = builtin
       ? badge(enabled?"ok":"off", enabled?"已启用":"未启用")
@@ -925,8 +1170,7 @@ function renderCurrentGroup(){
       <div class="dh" title="按住拖动调整顺序">⋮⋮</div>
       <div class="mic">${builtin ? (pl.id==="xd"?"💖":"📀") : srcEmoji(pl.source)}</div>
       <div class="mmeta"><div class="mnm">${tag}${esc(pl.name)}</div><div class="mst">${sub}</div></div>
-      ${ctrl}
-      ${right}
+      <div class="mact">${ctrl}${right}</div>
     </div>`;
   }).join("");
   const body = list.length
@@ -947,7 +1191,7 @@ function renderSrcGroup(s){
     return `<div class="pl-src-row" data-name="${esc(pl.name)}">
       <div class="mic">🎵</div>
       <div class="mmeta"><div class="mnm">${esc(pl.name)}</div><div class="mst">${esc(s.name)} · ID ${esc(pl.id)}</div></div>
-      <button class="btn primary" ${added?"disabled":""} onclick="addToCur('${s.key}','${esc(String(pl.id))}','${esc(pl.name)}')">${added?"已加入":"加入当前歌单"}</button>
+      <div class="mact"><button class="btn primary" ${added?"disabled":""} onclick="addToCur('${s.key}','${esc(String(pl.id))}','${esc(pl.name)}')">${added?"已加入":"加入当前歌单"}</button></div>
     </div>`;
   }).join("");
   const body = pls.length ? rows : `<div class="empty">${esc(s.note||"该音源暂无可浏览歌单列表。")}</div>`;
