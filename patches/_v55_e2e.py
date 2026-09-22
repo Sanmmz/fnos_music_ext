@@ -20,8 +20,9 @@ from urllib.parse import quote
 
 SOCK = "/var/run/trim_music.socket"
 DB = "file:/usr/local/apps/@appdata/trim.music/db/music.db?mode=ro"
-PROBE = "/home/sanmmz/fnmusic_ext/access_probe.log"
-COVER_DIR = "/home/sanmmz/fnmusic_ext/cover_cache"
+HOME_DIR = os.environ.get("FNMUSIC_HOME") or os.path.expanduser("~/fnmusic_ext")
+PROBE = os.path.join(HOME_DIR, "access_probe.log")
+COVER_DIR = os.path.join(HOME_DIR, "cover_cache")
 
 con = sqlite3.connect(DB, uri=True)
 TOK = (con.execute("select token from user_token limit 1").fetchone() or [""])[0]

@@ -2,8 +2,9 @@
 # v55 沙箱单元验收：搜索结果「有海报 + 高音质」优先排序
 set -u
 SB=/tmp/v55t
-PY=/home/sanmmz/fnmusic_ext/.venv-proxy/bin/python
-REAL=/home/sanmmz/fnmusic_ext/proxy
+HOME_DIR="${FNMUSIC_HOME:-$HOME/fnmusic_ext}"
+PY="$HOME_DIR/.venv-proxy/bin/python"
+REAL="$HOME_DIR/proxy"
 
 echo "=== 0) 重建沙箱 $SB ==="
 rm -rf "$SB"

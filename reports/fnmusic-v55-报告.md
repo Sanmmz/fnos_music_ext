@@ -1,7 +1,7 @@
 # fnmusic-ext v55 变更与验收报告
 
 **时间**：2026-09-18 19:05
-**线上文件**：`/home/sanmmz/fnmusic_ext/proxy/app.py`
+**线上文件**：`~/fnmusic_ext/proxy/app.py`
 **sha1**：`3d9a65a3f92ebdc808442569fcc33204c58b85ca`　**体积**：233256 B（5849 行）
 **备份**：`app.py.bak.v54`（v54，210133 B，sha1 `2140acc7…`）
 **健康检查**：`{"ok":true,"version":"1.6.0",...,"degraded":false,"failures":[]}`　服务 `active`
@@ -247,7 +247,7 @@ netease_wait_s = 3.0s   ← search_track 等聚合的预算
 v55 **只改了 `proxy/app.py` 一个文件**，回滚 = 覆盖回备份 + 重启：
 
 ```bash
-D=/home/sanmmz/fnmusic_ext/proxy
+D=~/fnmusic_ext/proxy
 sudo cp -f "$D/app.py.bak.v54" "$D/app.py"     # 回到 v54（无任何 v55 代码）
 sudo systemctl restart fnmusic-ext
 curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz?deep=1
