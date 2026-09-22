@@ -51,9 +51,6 @@
   .page-head{margin-bottom:14px;flex:0 0 auto}
   .page-head h1{margin:0 0 4px;font-size:21px}
   .page-head p{margin:0;color:var(--muted)}
-  /* v82：音源页下方新增「音源总开关」面板，窗口很矮时让整块内容可滚动，
-     否则 .content 是 100vh + overflow:hidden，面板会被裁掉看不见。 */
-  .content{overflow-y:auto}
   .source-layout{display:flex;gap:22px;align-items:stretch;flex:1;min-height:0}
   /* 音源竖向列表（可排序） */
   .src-col{width:300px;flex:0 0 300px;display:flex;flex-direction:column;gap:10px;
@@ -498,8 +495,7 @@ function renderSources(){
         <div class="order-hint">搜索按此顺序优先调用，结果也优先置顶。</div>
       </div>
       <div class="detail-col" id="detailCol">${renderDetail()}</div>
-    </div>
-    ${renderSourceSwitches()}`;
+    </div>`;
   initDragSort(document.getElementById("srcCol"), {
     itemSel: ".src-row[data-sortable='1']",
     getKey: el => el.getAttribute("data-key"),
@@ -525,28 +521,6 @@ async function saveOrder(){
   }catch(e){ toast("保存顺序失败: "+(e.message||e),"err"); }
 }
 
-/* v82「音源总开关」：原在设置页的 4 个音源开关与音源页逐个开关重复，
-   收到音源页做一屏总览（同一个 env，两处开关实时一致）。 */
-function renderSourceSwitches(){
-  const s = STATE.sources; if(!s || s.code!==0) return "";
-  const rows = SOURCES.map(o=>{
-    const d = srcData(o.key) || {};
-    const st = statusOf(o.key);
-    return `<div class="row srow">
-      <div class="lab">${esc(o.name)}<div class="sub">${o.key==="xmly"?"小说等有声书专用，不参与常规歌曲搜索":"可用于在线搜索与取流"} · 当前：${esc(st.txt)}</div></div>
-      <label class="switch" title="启用 / 停用">
-        <input type="checkbox" data-env="${o.env}" ${d.enabled?"checked":""} onchange="toggleSrc(this)">
-        <span class="slider"></span>
-      </label>
-    </div>`;
-  }).join("");
-  return `<div class="panel" style="margin-top:16px;flex:0 0 auto">
-    <div class="ph"><div class="ttl"><span class="em">🎺</span><span>音源总开关</span></div>${badge("ok","与上方各音源页一致")}</div>
-    <div class="desc">在这里一次性开启 / 关闭全部音源；单个音源的详细配置（扫码登录、连接状态）点上方列表进入。
-      搜索优先顺序由上方列表右侧 <b>⋮⋮</b> 拖动决定，会自动保存。</div>
-    ${rows}
-  </div>`;
-}
 function renderDetail(){
   const k = STATE.selected;
   if(k==="netease") return renderNeteaseDetail();
@@ -742,7 +716,7 @@ async function loadSettings(){
   render();
 }
 /* v82：与其他页面重复的配置项不再出现在设置页 ——
-   · playlist 组（4 个音源开关）→ 音源页「音源总开关」
+   · playlist 组（4 个音源开关）→ 音源页每个音源的「启用该音源」开关
    · FNMUSIC_SOURCE_ORDER（音源优先顺序）→ 音源页拖动排序自动写入 */
 const SETTINGS_HIDDEN_GROUPS = ["playlist"];
 const SETTINGS_HIDDEN_ITEMS  = ["FNMUSIC_SOURCE_ORDER"];
