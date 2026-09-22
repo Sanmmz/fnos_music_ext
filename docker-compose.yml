@@ -75,3 +75,28 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+  # 喜马拉雅音源 xmly（宿主机端口 8774 -> 容器 8000）
+  # 一个专辑 = 一部小说 = App 里的一个歌单；播放依赖扫码登录后的 VIP cookie
+  xmly:
+    build:
+      context: ./xmly-service
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${FNMUSIC_BASE_IMAGE:-python:3.13-slim}
+        PIP_INDEX_URL: ${FNMUSIC_PIP_INDEX:-https://mirrors.aliyun.com/pypi/simple}
+    container_name: fnmusic-xmly
+    ports:
+      - "127.0.0.1:8774:8000"
+    volumes:
+      - ./xmly-data:/data
+    environment:
+      - XMLY_URL_TTL=1800
+      - XMLY_LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/healthz\")' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

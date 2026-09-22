@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fnmusic-ext 管理控制台</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --panel:#ffffff; --panel2:#fafbfc; --border:#e6e8eb;
+    --text:#1f2329; --muted:#8a9099; --brand:#2f6bff; --brand2:#1f4fd1;
+    --ok:#1faa5a; --warn:#e0a106; --bad:#e5484d; --off:#c4c9d0;
+    --shadow:0 1px 3px rgba(20,30,50,.06),0 6px 24px rgba(20,30,50,.06);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1115; --panel:#181b21; --panel2:#1d2128; --border:#2a2f38;
+      --text:#e8eaed; --muted:#8b929d; --brand:#4d86ff; --brand2:#6f9dff;
+      --ok:#2ecc71; --warn:#f2c14e; --bad:#ff6b6f; --off:#3a4049;
+      --shadow:0 1px 3px rgba(0,0,0,.4),0 8px 30px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+  /* 固定视口：长列表（如 63 个网易云榜单）在列内上下滚动，不再把整页撑长 */
+  .layout{display:flex;height:100vh;overflow:hidden}
+  /* 向导栏 / 导航 */
+  .sidebar{width:230px;flex:0 0 230px;background:var(--panel);border-right:1px solid var(--border);
+    display:flex;flex-direction:column;padding:18px 12px;position:sticky;top:0;height:100vh}
+  .brand{display:flex;align-items:center;gap:10px;padding:4px 10px 14px}
+  .brand .logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--brand),#7aa2ff);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-size:18px;box-shadow:var(--shadow)}
+  .brand .name{font-weight:700;font-size:15px}
+  .brand .sub{font-size:11px;color:var(--muted)}
+  .nav-label{font-size:11px;color:var(--muted);padding:6px 10px 6px;letter-spacing:.04em}
+  .nav{display:flex;flex-direction:column;gap:4px;margin-top:2px}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:11px 12px;border-radius:11px;cursor:pointer;
+    border:1px solid transparent;transition:.15s;font-weight:600}
+  .nav-item .ic{width:22px;text-align:center;font-size:16px}
+  .nav-item:hover{background:var(--panel2)}
+  .nav-item.active{background:color-mix(in srgb,var(--brand) 12%,transparent);
+    border-color:color-mix(in srgb,var(--brand) 35%,transparent);color:var(--brand)}
+  .sidebar .foot{margin-top:auto;font-size:11px;color:var(--muted);padding:10px 12px;border-top:1px solid var(--border)}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:0}
+  .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+  .dot.off{background:var(--off)} .dot.none{background:var(--muted)}
+  /* 内容 */
+  .content{flex:1;padding:24px 30px 22px;max-width:1100px;min-width:0;
+    height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  .page-head{margin-bottom:14px;flex:0 0 auto}
+  .page-head h1{margin:0 0 4px;font-size:21px}
+  .page-head p{margin:0;color:var(--muted)}
+  .source-layout{display:flex;gap:22px;align-items:stretch;flex:1;min-height:0}
+  /* 音源竖向列表（可排序） */
+  .src-col{width:300px;flex:0 0 300px;display:flex;flex-direction:column;gap:10px;
+    min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
+  /* 细滚动条，避免长列表滚动条太抢眼 */
+  .src-col::-webkit-scrollbar,.detail-col::-webkit-scrollbar,.manage-list::-webkit-scrollbar{width:8px}
+  .src-col::-webkit-scrollbar-thumb,.detail-col::-webkit-scrollbar-thumb,.manage-list::-webkit-scrollbar-thumb{
+    background:color-mix(in srgb,var(--muted) 45%,transparent);border-radius:8px}
+  .src-col::-webkit-scrollbar-track,.detail-col::-webkit-scrollbar-track,.manage-list::-webkit-scrollbar-track{background:transparent}
+  .src-row{display:flex;align-items:center;gap:11px;padding:13px 14px;border-radius:12px;cursor:pointer;
+    background:var(--panel);border:1px solid var(--border);box-shadow:var(--shadow);transition:.15s;
+    flex:0 0 auto}
+  .src-row:hover{border-color:var(--brand)}
+  .src-row.active{border-color:var(--brand);background:color-mix(in srgb,var(--brand) 8%,var(--panel))}
+  .src-row .pri{width:22px;height:22px;border-radius:6px;background:var(--panel2);border:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--muted);flex:0 0 22px}
+  .src-row .ic{width:30px;height:30px;border-radius:8px;background:var(--panel2);border:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 30px}
+  .src-row .meta{flex:1;min-width:0}
+  .src-row .nm{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .src-row .st{font-size:11px;color:var(--muted);margin-top:1px}
+  .src-row .move{display:flex;flex-direction:column;gap:2px}
+  .src-row .move button{width:22px;height:16px;border:1px solid var(--border);background:var(--panel2);color:var(--muted);
+    border-radius:5px;cursor:pointer;font-size:9px;line-height:1;padding:0;display:flex;align-items:center;justify-content:center}
+  .src-row .move button:hover{color:var(--brand);border-color:var(--brand)}
+  .src-row .move button:disabled{opacity:.35;cursor:not-allowed}
+  /* 拖拽排序手柄（指针事件实现，桌面 + 移动均可拖） */
+  .dh{flex:0 0 20px;display:flex;align-items:center;justify-content:center;color:var(--muted);
+    cursor:grab;touch-action:none;user-select:none;-webkit-user-select:none;font-size:13px;line-height:1;
+    border-radius:6px;padding:6px 2px;letter-spacing:1px}
+  .dh:hover{color:var(--brand);background:var(--panel2)}
+  .dh:active{cursor:grabbing}
+  .dragging{opacity:.75;border-color:var(--brand)!important;
+    background:color-mix(in srgb,var(--brand) 10%,var(--panel))!important;box-shadow:0 6px 18px rgba(0,0,0,.18)}
+  .order-hint{font-size:11px;color:var(--muted);padding:2px 4px}
+  .pl-group-label{font-size:11px;color:var(--muted);padding:14px 4px 6px;letter-spacing:.04em;font-weight:700}
+  .pl-group-label:first-child{padding-top:2px}
+  .src-row .st-src{font-size:11px;color:var(--muted);margin-top:1px}
+  /* 详情面板 */
+  .detail-col{flex:1;min-width:0;display:flex;flex-direction:column;
+    min-height:0;overflow-y:auto;overscroll-behavior:contain;padding-right:4px}
+  /* 长歌单列表：置顶工具条（搜索 + 计数）在滚动时保持可见 */
+  .list-toolbar{position:sticky;top:0;z-index:5;background:var(--panel);
+    display:flex;align-items:center;gap:10px;padding:10px 0 9px;margin:2px 0 10px;
+    border-bottom:1px solid var(--border)}
+  .list-toolbar .filter{flex:1;min-width:0;padding:8px 11px;border:1px solid var(--border);border-radius:9px;
+    background:var(--panel2);color:var(--text);font-size:13px;outline:none}
+  .list-toolbar .filter:focus{border-color:var(--brand)}
+  .list-toolbar .count{font-size:11px;color:var(--muted);white-space:nowrap}
+  /* 综合搜索：搜索条 */
+  .pl-search-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:nowrap}
+  .pl-search-bar .filter{flex:1;min-width:0;padding:9px 12px;border:1px solid var(--border);border-radius:10px;
+    background:var(--panel2);color:var(--text);font-size:13px;outline:none;min-height:40px}
+  .pl-search-bar .filter:focus{border-color:var(--brand)}
+  .pl-search-bar .btn{flex:0 0 auto;min-height:40px}
+  /* v77 综合搜索：搜索栏左侧的「歌单 / 小说」分段选择器 */
+  .pl-kind{display:flex;flex:0 0 auto;background:var(--panel2);border:1px solid var(--border);
+    border-radius:10px;padding:3px;gap:2px;min-height:40px;box-sizing:border-box}
+  .pl-kind button{border:0;background:transparent;color:var(--muted);font:inherit;font-size:13px;
+    padding:0 16px;border-radius:8px;cursor:pointer;white-space:nowrap;min-height:34px}
+  .pl-kind button.on{background:var(--brand);color:#fff;font-weight:600}
+  .pl-search-src{font-size:10px;padding:1px 6px;border-radius:6px;border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:22px 24px;box-shadow:var(--shadow);
+    animation:slideIn .22s ease}
+  @keyframes slideIn{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:none}}
+  .empty{background:var(--panel2);border:1px dashed var(--border);border-radius:14px;padding:46px 24px;text-align:center;color:var(--muted)}
+  .ph{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
+  .ph .ttl{display:flex;align-items:center;gap:11px;font-size:18px;font-weight:700}
+  .ph .ttl .em{font-size:21px}
+  .badge{font-size:12px;padding:4px 11px;border-radius:999px;font-weight:600;border:1px solid transparent;white-space:nowrap}
+  .badge.ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent);border-color:color-mix(in srgb,var(--ok) 35%,transparent)}
+  .badge.bad{color:var(--bad);background:color-mix(in srgb,var(--bad) 14%,transparent);border-color:color-mix(in srgb,var(--bad) 35%,transparent)}
+  .badge.warn{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+  .badge.off{color:var(--muted);background:var(--panel2);border-color:var(--border)}
+  .desc{color:var(--muted);font-size:13px;margin:2px 0 18px}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 0;border-top:1px solid var(--border)}
+  .row:first-of-type{border-top:none}
+  .row .lab{font-weight:600}
+  .row .lab .sub{font-weight:400;font-size:12px;color:var(--muted);margin-top:2px;max-width:420px}
+  /* 歌单卡片 */
+  .pl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+  .pl{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:12px}
+  .pl .top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .pl .nm{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px}
+  .pl .nm .em{font-size:19px}
+  .pl .pl-desc{font-size:12px;color:var(--muted)}
+  .pl .meta{font-size:12px;color:var(--muted)}
+  /* 歌单管理（分组 Master-Detail） */
+  .manage-list{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+  .pl-ai-cat{display:flex;flex-direction:column;gap:8px}
+  .pl-ai-cat-hd{display:flex;align-items:center;gap:8px;padding:2px 2px 0;flex-wrap:wrap}
+  .pl-ai-cat-hd .cem{font-size:16px}
+  .pl-ai-cat-hd .cnm{font-weight:700;font-size:14px}
+  .pl-ai-cat-hd .cdesc{font-size:11px;color:var(--muted)}
+  .pl-ai-cat+.pl-ai-cat{margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)}
+  /* 歌单生成器：参数 chips + 预览 */
+  .gen-dim{margin-bottom:14px}
+  .gen-dim-hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px}
+  .gen-dim-hd .dnm{font-weight:700;font-size:13px}
+  .gen-dim-hd .dhint{font-size:11px;color:var(--muted)}
+  .gen-chips{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{padding:7px 13px;border-radius:999px;border:1px solid var(--border);background:var(--panel);
+    font-size:13px;cursor:pointer;color:var(--text);transition:.15s;user-select:none}
+  .chip:hover{border-color:var(--brand)}
+  .chip.on{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+  .gen-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+  .gen-preview{margin-top:12px;border:1px solid var(--border);border-radius:12px;padding:12px 14px;background:var(--panel2)}
+  .gen-preview .gpn{font-weight:700;font-size:14px;margin-bottom:4px}
+  .gen-preview .gpmeta{font-size:11px;color:var(--muted);margin-bottom:8px}
+  .gen-sample{display:flex;flex-direction:column;gap:4px;margin:8px 0}
+  .gen-sample .gs{font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:baseline}
+  .gen-sample .gs b{color:var(--text);font-weight:600}
+  .gen-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .pl-manage-row,.pl-src-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;
+    background:var(--panel2);border:1px solid var(--border)}
+  .pl-manage-row .mmove{display:flex;flex-direction:column;gap:2px;flex:0 0 22px}
+  .pl-manage-row .mmove button{width:22px;height:16px;border:1px solid var(--border);background:var(--panel);color:var(--muted);
+    border-radius:5px;cursor:pointer;font-size:9px;line-height:1;padding:0;display:flex;align-items:center;justify-content:center}
+  .pl-manage-row .mmove button:hover{color:var(--brand);border-color:var(--brand)}
+  .pl-manage-row .mmove button:disabled{opacity:.35;cursor:not-allowed}
+  .pl-manage-row .mtag{font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:6px;
+    padding:1px 5px;line-height:14px;margin-right:6px;vertical-align:1px}
+  .pl-manage-row .mic,.pl-src-row .mic{width:30px;height:30px;border-radius:8px;background:var(--panel);border:1px solid var(--border);
+    display:flex;align-items:center;justify-content:center;font-size:16px;flex:0 0 30px}
+  .pl-manage-row .mmeta,.pl-src-row .mmeta{flex:1;min-width:0}
+  .pl-manage-row .mnm,.pl-src-row .mnm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pl-manage-row .mst,.pl-src-row .mst{font-size:11px;color:var(--muted);margin-top:1px}
+  .pl-manage-row .del{flex:0 0 auto;color:var(--bad);border-color:color-mix(in srgb,var(--bad) 40%,transparent)}
+  .pl-manage-row .del:hover{background:color-mix(in srgb,var(--bad) 12%,transparent);color:var(--bad);border-color:var(--bad)}
+  /* 网易云登录区 */
+  .ne-body{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;margin-top:6px}
+  .qr-wrap{background:#fff;border-radius:12px;padding:14px;display:flex;flex-direction:column;align-items:center;gap:10px;
+    border:1px solid var(--border);min-width:206px}
+  .qr-grid{display:grid;background:#fff;padding:9px;border-radius:6px}
+  .qr-cell{width:6px;height:6px;background:#fff}
+  .qr-cell.on{background:#0a0a0a}
+  .qr-meta{font-size:12px;color:var(--muted);text-align:center;max-width:216px}
+  .qr-meta a{color:var(--brand);word-break:break-all}
+  /* v76 喜马拉雅扫码：二维码是 base64 PNG，直接 <img> 渲染 */
+  .qr-img-wrap{background:#fff;border-radius:12px;padding:14px;display:flex;flex-direction:column;align-items:center;gap:10px;
+    border:1px solid var(--border);min-width:206px}
+  .qr-img{width:190px;height:190px;image-rendering:pixelated;background:#fff}
+  .ne-info{flex:1;min-width:240px}
+  .ne-status-line{font-size:13px;margin:2px 0 12px;color:var(--muted)}
+  .ne-status-line b{color:var(--text)}
+  /* 开关 */
+  .switch{position:relative;display:inline-block;width:46px;height:25px;flex:0 0 46px}
+  .switch input{display:none}
+  .slider{position:absolute;inset:0;background:var(--off);border-radius:999px;transition:.2s;cursor:pointer}
+  .slider:before{content:"";position:absolute;height:19px;width:19px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s;box-shadow:0 1px 2px rgba(0,0,0,.3)}
+  .switch input:checked + .slider{background:var(--brand)}
+  .switch input:checked + .slider:before{transform:translateX(21px)}
+  .btn{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:8px 15px;border-radius:9px;
+    cursor:pointer;font-size:13px;font-weight:600;transition:.15s}
+  .btn:hover{border-color:var(--brand);color:var(--brand)}
+  .btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.primary:hover{background:var(--brand2);color:#fff}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--text);color:var(--bg);
+    padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:50}
+  .toast.show{opacity:.95;pointer-events:auto}
+  .toast.err{background:var(--bad);color:#fff}
+  .login-mask{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60}
+  .login-box{background:var(--panel);border-radius:14px;padding:26px 28px;width:320px;box-shadow:var(--shadow)}
+  .login-box h3{margin:0 0 12px}
+  .login-box input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--text);font-size:14px;margin-bottom:14px}
+  .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--brand);
+    border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  /* 平板：收窄向导栏与留白，仍是左右布局 */
+  @media(max-width:1024px){
+    .sidebar{width:190px;flex:0 0 190px}
+    .content{padding:20px 20px 22px}
+  }
+  /* ============ 手机端适配（≤860px）============
+     原则：向导栏绝不隐藏（否则无法在「音源/歌单」间切换）→ 改为底部固定 Tab Bar；
+     内容单列整页滚动，避免「列内滚动 + 整页滚动」双滚动区打架；
+     触控目标 ≥44px；100dvh 规避移动端地址栏导致的 100vh 溢出。 */
+  @media(max-width:860px){
+    .layout{height:auto;min-height:100vh;min-height:100dvh;overflow:visible;flex-direction:column}
+    /* 向导栏 → 底部固定 Tab Bar */
+    .sidebar{position:fixed;left:0;right:0;bottom:0;top:auto;width:100%;flex:none;height:auto;
+      flex-direction:column;padding:0 0 env(safe-area-inset-bottom);border-right:none;
+      border-top:1px solid var(--border);background:var(--panel);z-index:50;
+      box-shadow:0 -2px 16px rgba(0,0,0,.12)}
+    .sidebar .brand,.sidebar .nav-label{display:none}
+    /* 连接状态保留为 Tab Bar 上方一条细状态条（不占高度、信息不丢） */
+    .sidebar .foot{margin-top:0;padding:5px 12px;border-top:none;border-bottom:1px solid var(--border);
+      font-size:10px;text-align:center}
+    .nav{flex-direction:row;gap:0;margin:0}
+    .nav-item{flex:1;flex-direction:column;justify-content:center;gap:3px;padding:8px 6px;
+      border-radius:0;border:none;font-size:11px;min-height:54px}
+    .nav-item:active,.nav-item:hover{background:var(--panel2)}
+    .nav-item.active{background:transparent;border:none;color:var(--brand);
+      box-shadow:inset 0 2px 0 var(--brand)}
+    .nav-item .ic{width:auto;font-size:18px}
+    /* 内容区：单列、整页滚动，底部留出 Tab Bar 空间 */
+    .content{height:auto;overflow:visible;max-width:none;min-height:0;
+      padding:16px 14px calc(110px + env(safe-area-inset-bottom))}
+    .source-layout{flex-direction:column;gap:12px;align-items:stretch;flex:none}
+    .detail-col{overflow:visible}
+    /* 歌单页的「分组列」→ 顶部横向滑动 chips（节省纵向空间）
+       注意：音源列 #srcCol 必须保持纵向，否则竖向拖动排序在手机上失效 */
+    .src-col:not(#srcCol){width:auto;flex:none;flex-direction:row;gap:8px;
+      overflow-x:auto;overflow-y:hidden;padding:2px 0 8px;-webkit-overflow-scrolling:touch}
+    .src-col:not(#srcCol)::-webkit-scrollbar{height:0}
+    .src-col:not(#srcCol) .src-row{width:auto;flex:0 0 auto;padding:10px 15px;
+      min-height:44px;border-radius:999px}
+    .src-col:not(#srcCol) .src-row .pri{display:none}
+    /* 音源列保持纵向（拖动排序需要竖向手势） */
+    #srcCol{width:auto;flex:none;overflow:visible;max-height:none}
+    /* 触控目标与字号 */
+    .src-row{min-height:52px;padding:14px}
+    .btn{min-height:40px;padding:10px 15px;font-size:14px}
+    .pl-src-row,.pl-manage-row{min-height:58px}
+    /* 拖动手柄：触控目标需 ≥44px，手机上加宽（桌面仍是细手柄） */
+    .dh{flex:0 0 44px;min-height:44px;padding:0;font-size:17px;background:var(--panel2);
+      border:1px solid var(--border)}
+    .pl-manage-row .dh,.pl-src-row .dh{margin-left:-2px}
+    .list-toolbar .filter{min-height:40px;font-size:16px} /* ≥16px 防 iOS 自动缩放 */
+    /* 综合搜索：手机上输入框同样 ≥16px 防缩放、≥44px 好按 */
+    /* v77：手机上「歌单/小说」选择器也要 ≥44px 好按，并把整条搜索栏改成可换行，
+       否则「选择器 + 输入框 + 按钮」挤在一行会让输入框变得极窄。 */
+    .pl-search-bar{flex-wrap:wrap}
+    .pl-kind{width:100%;justify-content:stretch}
+    .pl-kind button{flex:1;min-height:44px;font-size:16px}
+    .pl-search-bar .filter{min-height:44px;font-size:16px}
+    .pl-search-bar .btn{min-height:44px;padding:10px 18px}
+    .page-head{margin-bottom:12px}
+    .page-head h1{font-size:19px}
+    .page-head p{font-size:12px}
+    .panel{padding:16px 15px;border-radius:12px}
+    .ph{margin-bottom:14px}
+    /* 长列表在手机上整页滚动，工具条吸顶不遮挡 */
+    .list-toolbar{top:0}
+    .empty{padding:30px 16px}
+  }
+  /* 超窄屏（≤380px）：进一步压缩留白 */
+  @media(max-width:380px){
+    .content{padding:12px 10px calc(104px + env(safe-area-inset-bottom))}
+    .pl-src-row .btn,.pl-manage-row .btn{padding:8px 10px;font-size:13px}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">♪</div>
+      <div><div class="name">fnmusic-ext</div><div class="sub">音乐扩展控制台</div></div>
+    </div>
+    <div class="nav-label">管理</div>
+    <div class="nav">
+      <div class="nav-item active" id="nav-source" onclick="setView('source')"><span class="ic">🎚️</span><span>音源</span></div>
+      <div class="nav-item" id="nav-playlist" onclick="setView('playlist')"><span class="ic">📋</span><span>歌单</span></div>
+    </div>
+    <div class="foot">
+      <span class="dot" id="foot-dot"></span><span id="foot-txt">连接中…</span>
+    </div>
+  </aside>
+
+  <main class="content" id="content"></main>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="login-mask" id="loginMask" style="display:none">
+  <div class="login-box">
+    <h3>管理界面密码</h3>
+    <input id="tokenInput" type="password" placeholder="请输入 FNMUSIC_ADMIN_TOKEN" />
+    <button class="btn primary" id="tokenOk" style="width:100%">进入</button>
+  </div>
+</div>
+
+<script>
+const BASE = location.pathname.replace(/\/admin(\/.*)?$/, "").replace(/\/$/, "");
+function api(path, opts){
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers || {});
+  const t = token(); if(t) headers["X-Admin-Token"] = t;
+  if(opts.body) headers["Content-Type"] = "application/json";
+  return fetch(BASE + path, Object.assign({}, opts, {headers}));
+}
+function token(){ try{ return localStorage.getItem("fnmb_token") || ""; }catch(e){ return ""; } }
+function setToken(v){ try{ localStorage.setItem("fnmb_token", v); }catch(e){} }
+function toast(msg, kind){ const el=document.getElementById("toast"); el.textContent=msg; el.className="toast show"+(kind==="err"?" err":""); clearTimeout(el._t); el._t=setTimeout(()=>el.className="toast",2200); }
+function showLogin(){ document.getElementById("loginMask").style.display="flex"; document.getElementById("tokenInput").focus(); }
+
+const SOURCES = [
+  {key:"netease", em:"🎶", name:"网易云音乐", env:"FNMUSIC_NETEASE_ENABLED", sortable:true},
+  {key:"lx",      em:"🎧", name:"洛雪音乐 (LX)", env:"FNMUSIC_LX_ENABLED", sortable:true},
+  {key:"musicdl", em:"🐱", name:"音乐猫 (MusicDL)", env:"FNMUSIC_MUSICDL_ENABLED", sortable:true},
+  // v76 喜马拉雅：搜索带触发词「小说 xxx」时专用，不参与常规音乐搜索优先级
+  {key:"xmly",    em:"🎙️", name:"喜马拉雅（有声书）", env:"FNMUSIC_XMLY_ENABLED", sortable:false},
+];
+const SRC_MAP = Object.fromEntries(SOURCES.map(s=>[s.key,s]));
+const SORTABLE_KEYS = SOURCES.filter(s=>s.sortable).map(s=>s.key);
+
+let STATE = { view:"source", sources:null, playlists:null, order:null, selected:null, qr:null, poll:null, plSel:null, plFilter:"", plSearch:{q:"", kind:"playlist", results:null, loading:false, msg:""},
+  xmlyQr:null,
+  gen:{ dims:null, sizes:[20,30,40,60], region:[], mood:[], language:"any", size:40, result:null, loading:false, msg:"" } };
+
+document.getElementById("tokenOk").onclick = ()=>{
+  setToken(document.getElementById("tokenInput").value.trim());
+  document.getElementById("loginMask").style.display="none"; init();
+};
+document.getElementById("tokenInput").addEventListener("keydown", e=>{ if(e.key==="Enter") document.getElementById("tokenOk").click(); });
+
+init();
+async function init(){ await loadAll(); }
+
+async function loadAll(){
+  try{
+    const r = await api("/admin/api/sources");
+    if(r.status===401){ showLogin(); return; }
+    STATE.sources = await r.json();
+    // v76：喜马拉雅不参与常规搜索优先级排序，固定挂在列表末尾
+    const base = (STATE.sources.order || ["netease","lx","musicdl"]).filter(k=>SORTABLE_KEYS.includes(k));
+    STATE.order = base.concat(SORTABLE_KEYS.filter(k=>!base.includes(k)), ["xmly"]);
+  }catch(e){ STATE.sources = {code:1,error:String(e)}; }
+  if(STATE.view==="playlist"){
+    try{ const rp=await api("/admin/api/playlists"); STATE.playlists = await rp.json(); }catch(e){ STATE.playlists={code:1,error:String(e)}; }
+    if(!STATE.gen.dims){ try{ const rd=await api("/admin/api/playlists/dims"); const d=await rd.json();
+      if(d && d.code===0){ STATE.gen.dims=d.dims||[]; STATE.gen.sizes=d.sizes||[20,30,40,60]; STATE.gen.size=d.default_size||40; } }catch(e){} }
+  }
+  render(); updateFoot();
+}
+function setView(v){ stopPoll(); STATE.view=v; STATE.selected=null; STATE.qr=null; STATE.plSel=null;
+  document.getElementById("nav-source").className="nav-item"+(v==="source"?" active":"");
+  document.getElementById("nav-playlist").className="nav-item"+(v==="playlist"?" active":"");
+  if(v==="playlist" && !STATE.playlists){ loadAll(); return; }
+  render();
+}
+function srcData(k){ return STATE.sources ? STATE.sources[k] : null; }
+
+function statusOf(k){
+  const s = STATE.sources;
+  if(!s||s.code!==0) return {cls:"none", txt:"未知"};
+  if(k==="netease"){ const ne=s.netease; return ne.logged_in?{cls:"ok",txt:"已连接"}:(ne.cookie_ok?{cls:"warn",txt:"凭证失效"}:{cls:"off",txt:"未连接"}); }
+  if(k==="xmly"){ const x=s.xmly; if(!x||!x.enabled) return {cls:"off",txt:"已关闭"};
+    if(x.health!=="ok") return {cls:"bad",txt:"不可达"};
+    return x.logged_in?{cls:"ok",txt:(x.is_vip?"VIP 已登录":"已登录")}:{cls:"warn",txt:"未登录"}; }
+  const d = s[k]; const h = d&&d.health;
+  if(h==="ok") return {cls:"ok",txt:"正常"};
+  if(h==="disabled") return {cls:"off",txt:"已关闭"};
+  if(h==="unreachable"||h==="fail") return {cls:"bad",txt:"不可达"};
+  return {cls:"none",txt:"未知"};
+}
+
+/* ============ 渲染 ============ */
+function render(){
+  if(STATE.view==="playlist") return renderPlaylists();
+  renderSources();
+}
+function renderSources(){
+  const c = document.getElementById("content");
+  if(!STATE.sources || STATE.sources.code!==0){ c.innerHTML = `<div class="page-head"><h1>音源管理</h1></div>
+    <div class="empty">加载失败：${esc(STATE.sources&&STATE.sources.error||"未知")} <button class="btn" onclick="loadAll()">重试</button></div>`; return; }
+  const order = STATE.order && STATE.order.length ? STATE.order : (STATE.sources.order||["netease","lx","musicdl"]);
+  // v73：去掉「请选择左侧的一个音源查看配置」提示 —— 未选中时直接默认展开第一个音源
+  if(!STATE.selected && order.length) STATE.selected = order[0];
+  const rows = order.map((k,i)=>{
+    const o = SRC_MAP[k]; if(!o) return "";
+    const st = statusOf(k);
+    const active = STATE.selected===k ? " active" : "";
+    // v76：排序行才给拖拽把手；喜马拉雅是「触发词专用」音源，不参与优先级
+    const handle = o.sortable ? '<div class="dh" title="按住拖动调整优先级" onclick="event.stopPropagation()">⋮⋮</div>' : '';
+    return `<div class="src-row${active}" data-key="${k}" data-sortable="${o.sortable?1:0}" onclick="selectSrc('${k}')">
+      <div class="pri">${o.sortable?(order.filter(x=>SRC_MAP[x]&&SRC_MAP[x].sortable).indexOf(k)+1):"—"}</div>
+      <div class="ic">${o.em}</div>
+      <div class="meta"><div class="nm">${o.name}</div><div class="st"><span class="dot ${st.cls}"></span>${st.txt}</div></div>
+      ${handle}
+    </div>`;
+  }).join("");
+  c.innerHTML = `
+    <div class="page-head"><h1>音源管理</h1><p>点击音源查看配置；<b>拖动右侧 ⋮⋮</b> 调整搜索优先调用顺序（越靠上越优先）。</p></div>
+    <div class="source-layout">
+      <div class="src-col" id="srcCol">
+        ${rows}
+        <div class="order-hint">搜索按此顺序优先调用，结果也优先置顶。</div>
+      </div>
+      <div class="detail-col" id="detailCol">${renderDetail()}</div>
+    </div>`;
+  initDragSort(document.getElementById("srcCol"), {
+    itemSel: ".src-row[data-sortable='1']",
+    getKey: el => el.getAttribute("data-key"),
+    // v76：提交时剔掉非排序音源（xmly），它不参与常规音乐搜索优先级
+    onCommit: keys => {
+      const rest = STATE.order.filter(k=>k==="xmly"||!SORTABLE_KEYS.includes(k));
+      const sorted = keys.filter(k=>SORTABLE_KEYS.includes(k));
+      STATE.order = sorted.concat(rest); renderSources(); saveOrder();
+    },
+  });
+}
+function selectSrc(key){ stopPoll(); STATE.qr=null; STATE.xmlyQr=null; STATE.selected=key; renderSources(); scrollToDetail(); }
+async function saveOrder(){
+  // v76：xmly 不写进 FNMUSIC_SOURCE_ORDER —— 它是「小说 xxx」触发词专用音源，
+  //      写进去会让它参与常规歌曲搜索，拖慢正常搜索且挤占结果位。
+  const order = STATE.order.filter(k=>SORTABLE_KEYS.includes(k) && k!=="xmly").join(",");
+  try{
+    const r = await api("/admin/api/config", {method:"PUT", body: JSON.stringify({changes:{"FNMUSIC_SOURCE_ORDER": order}})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"保存失败");
+    if(STATE.sources) STATE.sources.order = STATE.order.slice();
+    toast("优先级已保存");
+  }catch(e){ toast("保存顺序失败: "+(e.message||e),"err"); }
+}
+
+function renderDetail(){
+  const k = STATE.selected;
+  if(k==="netease") return renderNeteaseDetail();
+  if(k==="xmly") return renderXmlyDetail();
+  const d = srcData(k); const o = SRC_MAP[k];
+  const enabled = !!(d && d.enabled);
+  const hb = healthBadge(d && d.health);
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">${o.em}</span><span>${o.name}</span></div>${hb}</div>
+    <div class="desc">${srcDesc(k)}</div>
+    <div class="row">
+      <div class="lab">启用该音源<div class="sub">关闭后前端将不再使用此音源搜索/播放</div></div>
+      <label class="switch" title="启用 / 停用">
+        <input type="checkbox" data-env="${o.env}" ${enabled?"checked":""} onchange="toggleSrc(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row"><div class="lab">连接状态</div><div>${hb}</div></div>
+    <div class="actions"><button class="btn" onclick="loadAll()">刷新状态</button></div>
+  </div>`;
+}
+function srcDesc(k){
+  return {netease:"网易云音乐取流后端（musicbox）。",
+          lx:"洛雪音乐（LX）在线音源，提供在线搜索与播放。",
+          musicdl:"MusicDL 音源，提供额外的在线曲目检索。",
+          xmly:"喜马拉雅有声书音源。搜索小说 xxx 时专用：一部小说 = 一个专辑 = App 里的一个歌单。扫码登录后才能播放 VIP/付费专辑。"}[k] || "";
+}
+/* ===== v76 喜马拉雅扫码登录 ===== */
+function renderXmlyDetail(){
+  const x = STATE.sources.xmly || {}; const logged = x.logged_in; let body;
+  if(logged){
+    body = `<div class="ne-info"><div class="ne-status-line"><span class="dot ok"></span>喜马拉雅账号 <b>${esc(x.nickname||"已登录")}</b> 已连接${x.is_vip?"（VIP 权益可用）":"（未识别到 VIP，付费专辑可能只能试听）"}</div>
+      <div class="actions"><button class="btn" onclick="startXmlyQR()">重新扫码登录</button><button class="btn" onclick="xmlyLogout()">退出登录</button><button class="btn" onclick="loadAll()">刷新状态</button></div></div>`;
+  } else if(STATE.xmlyQr){ body = renderXmlyQRBlock(); }
+  else { body = `<div class="ne-info"><div class="ne-status-line"><span class="dot warn"></span>喜马拉雅 <b>未登录</b>，付费/VIP 专辑只能试听。</div>
+    <div class="actions"><button class="btn primary" onclick="startXmlyQR()">扫码登录</button></div></div>`; }
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">🎙️</span><span>喜马拉雅（有声书）</span></div>${logged?badge("ok","已连接"):badge("off","未登录")}</div>
+    <div class="desc">${srcDesc("xmly")}</div>
+    <div class="ne-body">${body}</div>
+    ${x.error?`<div class="row"><div class="lab">后端异常<div class="sub">${esc(x.error)}</div></div></div>`:""}
+    <div class="row" style="margin-top:18px">
+      <div class="lab">启用喜马拉雅音源<div class="sub">停用后 App 里不再返回喜马拉雅结果</div></div>
+      <label class="switch" title="启用 / 停用">
+        <input type="checkbox" data-env="FNMUSIC_XMLY_ENABLED" ${x.enabled?"checked":""} onchange="toggleSrc(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row"><div class="lab">后端服务 xmly<div class="sub">搜索 / 专辑 / 取流 / 扫码登录后端</div></div><div>${healthBadge(x.health)}</div></div>
+    <div class="row"><div class="lab">用法<div class="sub">在 App 搜索框输入「<b>小说 吞噬星空</b>」，歌单页即出现对应专辑</div></div></div>
+  </div>`;
+}
+function renderXmlyQRBlock(){
+  const q = STATE.xmlyQr;
+  if(!q||!q.img) return `<div class="ne-info"><div class="ne-status-line">二维码获取失败，请点击刷新。</div>
+    <div class="actions"><button class="btn" onclick="startXmlyQR()">刷新二维码</button></div></div>`;
+  return `<div class="qr-img-wrap">
+      <img class="qr-img" alt="喜马拉雅登录二维码" src="data:image/png;base64,${q.img}">
+      <div class="qr-meta">请使用 <b>喜马拉雅 App</b> 扫码<div id="xmlyHint" style="margin-top:6px">等待扫码…</div></div>
+    </div>
+    <div class="ne-info"><div class="ne-status-line">扫码后在手机上点「确认登录」，此页会自动刷新状态。</div>
+    <div class="actions"><button class="btn" onclick="startXmlyQR()">刷新二维码</button><button class="btn" onclick="cancelXmlyQR()">取消</button></div></div>`;
+}
+async function startXmlyQR(){
+  STATE.xmlyQr=null; stopPoll(); renderSources();
+  try{
+    const r = await api("/admin/api/xmly/qr");
+    const d = await r.json();
+    if(!d.ok || !d.qrId){ toast("获取二维码失败: "+(d.msg||"未知错误"),"err"); STATE.xmlyQr=null; renderSources(); return; }
+    STATE.xmlyQr=d; renderSources(); pollXmlyQR(d.qrId);
+  }catch(e){ toast("获取二维码失败: "+e,"err"); }
+}
+function cancelXmlyQR(){ STATE.xmlyQr=null; stopPoll(); renderSources(); }
+function pollXmlyQR(qrId){
+  stopPoll();
+  STATE.poll = setInterval(async ()=>{
+    try{
+      const r = await api("/admin/api/xmly/qr/check?qrId="+encodeURIComponent(qrId));
+      const d = await r.json();
+      const hint = document.getElementById("xmlyHint");
+      const txt = {"pending":"等待扫码…","scanned":"已扫码，请在手机端确认","success":"登录成功","expired":"二维码已过期，请刷新"}[d.status] || ("请稍候…"+String(d.status||""));
+      if(hint) hint.textContent = txt;
+      if(d.status==="success"){ stopPoll(); STATE.xmlyQr=null; toast("喜马拉雅登录成功"); await loadAll(); return; }
+      if(d.status==="expired"){ stopPoll(); return; }
+    }catch(e){ /* 单次轮询错误忽略 */ }
+  }, 2000);
+}
+async function xmlyLogout(){
+  stopPoll();
+  try{
+    await api("/admin/api/xmly/logout", {method:"POST"});
+    STATE.xmlyQr=null; toast("已退出喜马拉雅登录"); await loadAll();
+  }catch(e){ toast("退出失败: "+e,"err"); }
+}
+function renderNeteaseDetail(){
+  const ne = STATE.sources.netease; const logged = ne.logged_in; let body;
+  if(logged){
+    body = `<div class="ne-info"><div class="ne-status-line"><span class="dot ${ne.cookie_ok?"ok":"warn"}"></span>网易云账号 <b>${esc(ne.nickname||"已登录")}</b> 已连接${ne.cookie_ok?"，取流凭证有效":"，但取流凭证无效"}</div>
+      <div class="actions"><button class="btn" onclick="startQR()">重新扫码登录</button><button class="btn" onclick="loadAll()">刷新状态</button></div></div>`;
+  } else if(STATE.qr){ body = renderQRBlock(); }
+  else { body = `<div class="ne-info"><div class="ne-status-line"><span class="dot bad"></span>网易云 <b>未登录</b>，部分取流能力不可用。</div>
+    <div class="actions"><button class="btn primary" onclick="startQR()">扫码登录</button></div></div>`; }
+  const backend = STATE.sources.musicbox;
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">🎶</span><span>网易云音乐</span></div>${logged?badge("ok","已连接"):badge("off","未连接")}</div>
+    <div class="ne-body">${body}</div>
+    <div class="row" style="margin-top:18px">
+      <div class="lab">启用网易云（含 musicbox 后端）<div class="sub">同时控制取流后端 musicbox 的启用</div></div>
+      <label class="switch" title="启用 / 停用">
+        <input type="checkbox" data-env="FNMUSIC_NETEASE_ENABLED" ${ne.enabled?"checked":""} onchange="toggleSrc(this)">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="row"><div class="lab">后端服务 musicbox<div class="sub">网易云取流与扫码登录后端</div></div><div>${healthBadge(backend && backend.health)}</div></div>
+  </div>`;
+}
+function renderQRBlock(){
+  const q = STATE.qr;
+  if(!q||!q.qr_ascii) return `<div class="ne-info"><div class="ne-status-line">二维码获取失败，请点击刷新。</div>
+    <div class="actions"><button class="btn" onclick="startQR()">刷新二维码</button></div></div>`;
+  return `<div class="qr-wrap"><div class="qr-grid" id="qrGrid"></div>
+    <div class="qr-meta">请使用 <b>网易云音乐 App</b> 扫码登录<div id="qrHint" style="margin-top:6px"></div>
+      ${q.qr_url?`<a href="${esc(q.qr_url)}" target="_blank" rel="noopener">或打开登录链接</a>`:""}</div></div>
+    <div class="ne-info"><div class="ne-status-line">扫描后将在手机端确认登录。</div>
+    <div class="actions"><button class="btn" onclick="startQR()">刷新二维码</button><button class="btn" onclick="cancelQR()">取消</button></div></div>`;
+}
+function paintQR(ascii){
+  const lines = ascii.split("\n").filter(l=>l.length);
+  const cols = Math.max(...lines.map(l=>l.length));
+  const rows = lines.length*2;
+  const grid = document.getElementById("qrGrid"); if(!grid) return;
+  grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+  let html="";
+  for(let r=0;r<rows;r++){
+    const li = lines[Math.floor(r/2)] || ""; const isTop = (r%2===0);
+    for(let c=0;c<cols;c++){
+      const ch = li[c] || " ";
+      const on = (ch==="█") || (ch==="▀" && isTop) || (ch==="▄" && !isTop);
+      html += on ? '<div class="qr-cell on"></div>' : '<div class="qr-cell"></div>';
+    }
+  }
+  grid.innerHTML = html;
+}
+async function startQR(){
+  STATE.qr=null; stopPoll(); renderSources();
+  try{
+    const r = await api("/admin/api/netease/qr", {method:"POST"});
+    const d = await r.json();
+    if(!d.unikey){ toast("获取二维码失败","err"); return; }
+    STATE.qr=d; renderSources(); paintQR(d.qr_ascii); pollQR(d.unikey);
+  }catch(e){ toast("获取二维码失败: "+e,"err"); }
+}
+function cancelQR(){ STATE.qr=null; stopPoll(); renderSources(); }
+function stopPoll(){ if(STATE.poll){ clearInterval(STATE.poll); STATE.poll=null; } }
+function pollQR(unikey){
+  stopPoll();
+  STATE.poll = setInterval(async ()=>{
+    try{
+      const r = await api("/admin/api/netease/qr/check?unikey="+encodeURIComponent(unikey));
+      const d = await r.json();
+      const hint = document.getElementById("qrHint");
+      if(d.logged_in || d.code===803){ stopPoll(); STATE.qr=null; toast("登录成功"); await loadAll(); return; }
+      if(d.code===800){ stopPoll(); if(hint) hint.innerHTML='<span style="color:var(--bad)">二维码已过期，请刷新</span>'; return; }
+      if(hint){ hint.textContent = (d.code===801?"已扫码，待确认":(d.message||"等待扫码…")); }
+    }catch(e){ /* 忽略单次轮询错误，继续 */ }
+  }, 2000);
+}
+async function toggleSrc(box){
+  const env = box.getAttribute("data-env"); const on = box.checked; box.disabled=true;
+  try{
+    const r = await api("/admin/api/config", {method:"PUT", body: JSON.stringify({changes:{[env]: on?"true":"false"}})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"保存失败");
+    toast(on?"已启用":"已停用"); await loadAll();
+  }catch(e){ box.checked=!on; toast("操作失败: "+(e.message||e),"err"); }
+  finally{ box.disabled=false; }
+}
+
+/* ============ 歌单（分组 Master-Detail） ============ */
+function srcEmoji(k){ return {netease:"🎶",kuwo:"🎵",migu:"🎤",lx:"🎧",musicdl:"🐱",ai:"✨",custom:"🎛️",xmly:"🎙️"}[k] || "🎵"; }
+function srcName(k){ return {netease:"网易云音乐",kuwo:"酷我音乐",migu:"咪咕音乐",lx:"洛雪音乐",musicdl:"音乐猫",ai:"AI 智能组装",custom:"自定义生成",xmly:"喜马拉雅"}[k] || k; }
+function isAdded(source, source_id){
+  const cur = STATE.playlists && STATE.playlists.current || [];
+  return cur.some(p=>p.source===source && String(p.source_id)===String(source_id));
+}
+function renderPlaylists(){
+  const c = document.getElementById("content");
+  const p = STATE.playlists;
+  if(!p || p.code!==0){ c.innerHTML = `<div class="page-head"><h1>歌单管理</h1></div>
+    <div class="empty">加载失败：${esc(p&&p.error||"未知")} <button class="btn" onclick="loadAll()">重试</button></div>`; return; }
+  const groups = [];
+  const curCount = (p.current||[]).length;
+  // v77：「歌单综合搜索」改名「综合搜索」——除歌单外还能搜喜马拉雅小说
+  groups.push({key:"search", em:"🔍", label:"综合搜索", sub:"歌单 / 小说", sel: STATE.plSel==="search"});
+  // v73：用户要求「歌单生成排在歌单搜索下方」—— 生成器紧跟搜索，排在当前歌单之前
+  groups.push({key:"gen", em:"🎛️", label:"歌单生成器", sub:"自定义组合", sel: STATE.plSel==="gen"});
+  groups.push({key:"current", em:"📂", label:"当前歌单", sub: curCount+" 个已载入", sel: STATE.plSel==="current"});
+  // v71：AI 歌单分组已下线
+  (p.sources||[]).forEach(s=>{
+    const n = (s.playlists||[]).length;
+    groups.push({key:"src:"+s.key, em: srcEmoji(s.key), label: s.name+" 歌单",
+      sub: n ? n+" 个歌单" : (s.enabled ? "暂不可浏览" : "已关闭"), sel: STATE.plSel===("src:"+s.key)});
+  });
+  const rows = groups.map(g=>`<div class="src-row${g.sel?" active":""}" onclick="selectPlGroup('${g.key}')">
+    <div class="ic">${g.em}</div>
+    <div class="meta"><div class="nm">${esc(g.label)}</div><div class="st">${esc(g.sub)}</div></div>
+  </div>`).join("");
+  // v73：去掉「请选择左侧的分组查看详情」提示 —— 未选中时默认展开第一组（综合搜索）
+  if(!STATE.plSel) STATE.plSel = "search";
+  const detail = renderPlGroup();
+  c.innerHTML = `<div class="page-head"><h1>歌单管理</h1><p>当前歌单为已载入飞牛音乐的歌单（可拖动排序 / 开关 / 删除）；点击各音源歌单分组，可把平台歌单加入当前歌单。</p></div>
+    <div class="source-layout">
+      <div class="src-col">${rows}</div>
+      <div class="detail-col" id="detailCol">${detail}</div>
+    </div>`;
+  const ul = document.getElementById("curList");
+  if(ul){
+    initDragSort(ul, {
+      itemSel: ".pl-manage-row",
+      getKey: el => el.getAttribute("data-id"),
+      onCommit: ids => applyReorder(ids),
+    });
+  }
+  restorePlFilter();
+}
+function selectPlGroup(key){ STATE.plSel = key; renderPlaylists(); scrollToDetail(); }
+function renderPlGroup(){
+  const p = STATE.playlists, sel = STATE.plSel;
+  if(sel==="search") return renderSearchGroup();
+  if(sel==="current") return renderCurrentGroup();
+  if(sel==="ai"){ STATE.plSel="gen"; return renderGenGroup(); }  // v71: AI 歌单已下线
+  if(sel==="gen") return renderGenGroup();
+  if(typeof sel==="string" && sel.indexOf("src:")===0){
+    const key = sel.slice(4);
+    const s = (p.sources||[]).find(x=>x.key===key);
+    if(!s) return '<div class="empty">音源不存在</div>';
+    return renderSrcGroup(s);
+  }
+  return '';
+}
+/* ============ 综合搜索（歌单 / 小说） ============ */
+const PL_KINDS = [{key:"playlist", label:"歌单"}, {key:"novel", label:"小说"}];
+function plKind(){ return (STATE.plSearch && STATE.plSearch.kind) || "playlist"; }
+function plKindLabel(){ const k = plKind(); const o = PL_KINDS.find(x=>x.key===k); return o ? o.label : "歌单"; }
+function plPlaceholder(){
+  return plKind()==="novel" ? "输入小说名，如：吞噬星空 / 三体 / 明朝那些事"
+                            : "输入歌单名，如：周杰伦 / 华语 / 说唱";
+}
+function renderSearchGroup(){
+  const st = STATE.plSearch || (STATE.plSearch = {q:"", kind:"playlist", results:null, loading:false, msg:""});
+  if(!st.kind) st.kind = "playlist";
+  const isNovel = st.kind === "novel";
+  const seg = PL_KINDS.map(k=>
+    `<button class="${st.kind===k.key?'on':''}" onclick="setPlKind('${k.key}')">${k.label}</button>`).join("");
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">🔍</span><span>综合搜索</span></div>${badge("ok", isNovel?"喜马拉雅小说":"网易云 + 酷我")}</div>
+    <div class="desc">${isNovel
+      ? `搜索<b>喜马拉雅</b>的有声书。一部小说 = 一个专辑 = App 里的一个歌单，加入后整部小说的全部章节都会载入飞牛音乐。搜索结果按专辑返回，点「加入当前歌单」即可。`
+      : `一次搜索<b>网易云音乐</b>与<b>酷我音乐</b>的歌单，找到后直接加入「当前歌单」，随即载入飞牛音乐。`}
+      ${isNovel?"":"切换到「小说」可以搜喜马拉雅的有声书。"}</div>
+    <div class="pl-search-bar">
+      <div class="pl-kind">${seg}</div>
+      <input class="filter" id="plSearchInput" value="${esc(st.q)}"
+        placeholder="${plPlaceholder()}" onkeydown="if(event.key==='Enter')doPlSearch()">
+      <button class="btn primary" onclick="doPlSearch()">${st.loading?"搜索中…":"搜索"}</button>
+    </div>
+    <div class="manage-list" id="plSearchResults">${renderSearchResults(st)}</div>
+  </div>`;
+}
+function renderSearchResults(st){
+  const isNovel = (st.kind||"playlist") === "novel";
+  const what = isNovel ? "小说" : "歌单";
+  if(st.loading) return `<div class="empty">正在搜索${what}「${esc(st.q)}」…</div>`;
+  if(st.msg) return `<div class="empty">${esc(st.msg)}</div>`;
+  if(!st.results) return `<div class="empty">输入关键字开始搜索。${isNovel
+    ? "结果来自喜马拉雅的公开专辑（一部小说 = 一个专辑）。"
+    : "结果来自网易云音乐与酷我音乐的公开歌单。"}</div>`;
+  if(!st.results.length) return `<div class="empty">没有找到与「${esc(st.q)}」相关的${what}。</div>`;
+  return st.results.map(r=>{
+    const added = isAdded(r.source, String(r.id));
+    const cnt = r.tracks ? (isNovel ? (r.tracks + " 集") : (r.tracks + " 首")) : "";
+    const sub = [
+      `<span class="pl-search-src">${esc(r.source_name||srcName(r.source))}</span>`,
+      r.creator ? esc(r.creator) : "",
+      r.category ? esc(r.category) : "",
+      cnt
+    ].filter(Boolean).join(" · ");
+    return `<div class="pl-src-row">
+      <div class="mic">${srcEmoji(r.source)}</div>
+      <div class="mmeta"><div class="mnm">${esc(r.name)}</div><div class="mst">${sub}</div>
+        ${isNovel && r.intro ? `<div class="mst" style="opacity:.75">${esc(String(r.intro).slice(0,90))}</div>`:""}</div>
+      <button class="btn${added?"":" primary"}" ${added?"disabled":""}
+        onclick="addToCur('${r.source}','${esc(String(r.id))}','${esc(r.name)}','${esc(String(r.cover||""))}')">${added?"已加入":"加入当前歌单"}</button>
+    </div>`;
+  }).join("");
+}
+/* 切换「歌单 / 小说」：只改选择器高亮 + 输入框占位符 + 结果区，
+   不整页重渲染 —— 否则输入框会失焦、已输入的关键字也保不住。 */
+function setPlKind(kind){
+  const st = STATE.plSearch; st.kind = kind; st.results = null; st.msg = "";
+  document.querySelectorAll(".pl-kind button").forEach(b=>{
+    b.classList.toggle("on", b.textContent.trim() === (PL_KINDS.find(x=>x.key===kind)||{}).label);
+  });
+  const inp = document.getElementById("plSearchInput");
+  if(inp) inp.placeholder = plPlaceholder();
+  const badgeEl = document.querySelector(".panel .ph .badge");
+  if(badgeEl) badgeEl.textContent = kind === "novel" ? "喜马拉雅小说" : "网易云 + 酷我";
+  const descEl = document.querySelector(".panel .desc");
+  if(descEl){
+    descEl.innerHTML = (kind === "novel"
+      ? `搜索<b>喜马拉雅</b>的有声书。一部小说 = 一个专辑 = App 里的一个歌单，加入后整部小说的全部章节都会载入飞牛音乐。搜索结果按专辑返回，点「加入当前歌单」即可。`
+      : `一次搜索<b>网易云音乐</b>与<b>酷我音乐</b>的歌单，找到后直接加入「当前歌单」，随即载入飞牛音乐。 切换到「小说」可以搜喜马拉雅的有声书。`);
+  }
+  paintSearch();
+}
+async function doPlSearch(){
+  const el = document.getElementById("plSearchInput");
+  const st = STATE.plSearch;
+  st.q = el ? el.value.trim() : "";
+  const isNovel = (st.kind||"playlist") === "novel";
+  const what = isNovel ? "小说" : "歌单";
+  if(!st.q){ st.results=null; st.msg=""; paintSearch(); return; }
+  st.loading = true; st.msg = ""; paintSearch();
+  try{
+    const r = await api("/admin/api/playlists/search?q=" + encodeURIComponent(st.q)
+      + "&limit=20&kind=" + encodeURIComponent(st.kind||"playlist"));
+    const d = await r.json();
+    if(d && d.code === 0){
+      st.results = d.results || [];
+      st.msg = st.results.length ? "" : `没有找到与「${st.q}」相关的${what}。`;
+    }else{
+      st.results = null; st.msg = (d && d.msg) || "搜索失败";
+    }
+  }catch(e){ st.results = null; st.msg = "搜索失败：" + ((e && e.message) || e); }
+  st.loading = false; paintSearch();
+}
+/* 只局部重绘结果区，避免整页重渲染导致输入框失焦 */
+function paintSearch(){
+  const box = document.getElementById("plSearchResults");
+  if(box) box.innerHTML = renderSearchResults(STATE.plSearch);
+  const btn = document.querySelector(".pl-search-bar .btn");
+  if(btn) btn.textContent = STATE.plSearch.loading ? "搜索中…" : "搜索";
+}
+
+/* ============ 歌单生成器（自定义参数组合） ============ */
+function genDim(key){
+  return (STATE.gen.dims||[]).find(d=>d.key===key) || null;
+}
+function renderGenGroup(){
+  const g = STATE.gen;
+  if(!g.dims) return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">🎛️</span><span>歌单生成器</span></div></div>
+    <div class="empty">正在加载可选项… <button class="btn" onclick="loadAll()">重试</button></div></div>`;
+  const dimBlocks = ["region","mood","language"].map(k=>{
+    const d = genDim(k); if(!d) return "";
+    const multi = !!d.multi;
+    const chips = (d.options||[]).map(o=>{
+      const on = multi ? (g[k]||[]).indexOf(o.key)>=0 : g[k]===o.key;
+      return `<span class="chip${on?" on":""}" onclick="toggleGenOpt('${k}','${esc(o.key)}',${multi})">${esc(o.name)}</span>`;
+    }).join("");
+    const hint = multi ? "可多选，不选=不限" : "单选";
+    return `<div class="gen-dim">
+      <div class="gen-dim-hd"><span class="dnm">${esc(d.name)}</span><span class="dhint">${hint}</span></div>
+      <div class="gen-chips">${chips}</div>
+    </div>`;
+  }).join("");
+  const sizeChips = (g.sizes||[]).map(s=>
+    `<span class="chip${String(g.size)===String(s)?" on":""}" onclick="setGenSize(${s})">${s} 首</span>`).join("");
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">🎛️</span><span>歌单生成器</span></div>${badge("ok","自定义组合")}</div>
+    <div class="desc">按<b>地区 / 心情 / 语言</b>自由组合；后台按维度分配席位、榜内加权抽样，
+      <b>优先采用网易云音源</b>（不足时才用酷我补齐）并跨榜去重。同样的条件结果稳定，换条件即换一批歌。
+      生成后可预览曲目，再决定是否加入「当前歌单」。</div>
+    ${dimBlocks}
+    <div class="gen-dim">
+      <div class="gen-dim-hd"><span class="dnm">规模</span><span class="dhint">单张歌单曲目数</span></div>
+      <div class="gen-chips">${sizeChips}</div>
+    </div>
+    <div class="gen-foot">
+      <button class="btn primary" onclick="doGenerate()">${g.loading?"生成中…":"生成歌单"}</button>
+      <button class="btn" onclick="resetGen()">重置条件</button>
+      ${g.msg?`<span class="dhint">${esc(g.msg)}</span>`:""}
+    </div>
+    <div id="genPreview">${renderGenPreview()}</div>
+  </div>`;
+}
+function renderGenPreview(){
+  const g = STATE.gen, r = g.result;
+  if(g.loading) return `<div class="gen-preview"><div class="gpn">正在生成…</div>
+    <div class="gpmeta">正在从各平台榜单筛选并组装，通常需要数秒。</div></div>`;
+  if(!r) return `<div class="gen-preview"><div class="gpn">尚未生成</div>
+    <div class="gpmeta">选择上方条件后点击「生成歌单」，这里会显示结果预览。</div></div>`;
+  if(r.code!==0) return `<div class="gen-preview"><div class="gpn">生成失败</div>
+    <div class="gpmeta">${esc(r.msg||"未知错误")}</div></div>`;
+  const added = isAdded("custom", String(r.key));
+  const sample = (r.sample||[]).map(s=>
+    `<div class="gs">· <b>${esc(s.title||"未知")}</b><span>${esc(s.artist||"")}</span></div>`).join("");
+  return `<div class="gen-preview">
+    <div class="gpn">${esc(r.name||"自定义歌单")}</div>
+    <div class="gpmeta">共 ${r.track_count||0} 首 · 取自 ${r.charts||0} 个真实榜单${r.netease_first?" · 网易优先":""}</div>
+    ${r.low_yield?`<div class="gpmeta" style="color:#b26a00">⚠ 当前条件只取到 ${r.track_count||0} 首（目标 ${r.requested_size||40} 首）。可放宽地区 / 心情，或把语言改为「不限」后再生成。</div>`:""}
+    ${sample?`<div class="gen-sample">${sample}</div>`:""}
+    <div class="gen-actions">
+      <button class="btn primary" ${added?"disabled":""}
+        onclick="addToCur('custom','${esc(String(r.key))}','${esc(r.name||"自定义歌单")}')">${added?"已加入当前歌单":"加入当前歌单"}</button>
+      <button class="btn" onclick="doGenerate()">重新生成</button>
+    </div>
+  </div>`;
+}
+function toggleGenOpt(dim, key, multi){
+  const g = STATE.gen;
+  if(multi){
+    const arr = (g[dim]||[]).slice();
+    const i = arr.indexOf(key);
+    if(i>=0) arr.splice(i,1); else arr.push(key);
+    g[dim] = arr;
+  }else{
+    g[dim] = key;
+  }
+  g.result = null; g.msg = "";
+  renderPlaylists();
+}
+function setGenSize(s){ STATE.gen.size = s; STATE.gen.result=null; STATE.gen.msg=""; renderPlaylists(); }
+function resetGen(){
+  STATE.gen.region=[]; STATE.gen.mood=[]; STATE.gen.language="any";
+  STATE.gen.size=40; STATE.gen.result=null; STATE.gen.msg="";
+  renderPlaylists();
+}
+async function doGenerate(){
+  const g = STATE.gen;
+  g.loading = true; g.msg = ""; g.result = null; renderPlaylists();
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({
+      action:"generate", region:g.region, mood:g.mood, language:g.language, size:g.size })});
+    if(r.status===401){ showLogin(); g.loading=false; renderPlaylists(); return; }
+    const d = await r.json();
+    g.result = d;
+    if(d && d.code!==0) g.msg = d.msg || "生成失败";
+  }catch(e){ g.result = {code:1, msg:String(e)}; }
+  g.loading = false;
+  renderPlaylists();
+}
+
+function renderCurrentGroup(){
+  const p = STATE.playlists;
+  const list = (p.current||[]).slice();
+  // 全部行都可拖动（含内置的「每日推荐」）；内置项不可删除
+  const rows = list.map(pl=>{
+    const enabled = !!pl.enabled;
+    const builtin = !!pl.builtin;
+    const ctrl = builtin
+      ? (pl.env
+        ? `<label class="switch" title="启用 / 停用"><input type="checkbox" data-env="${esc(pl.env)}" ${enabled?"checked":""} onchange="toggleSrc(this)"><span class="slider"></span></label>`
+        : `<span class="meta">${pl.mode?("模式 "+esc(pl.mode)):"常驻"}</span>`)
+      : `<label class="switch" title="启用 / 停用"><input type="checkbox" data-id="${esc(pl.id)}" ${enabled?"checked":""} onchange="toggleCur(this)"><span class="slider"></span></label>`;
+    const right = builtin
+      ? badge(enabled?"ok":"off", enabled?"已启用":"未启用")
+      : `<button class="btn" title="清除缓存，下次打开时重新从源站拉取" onclick="refreshCur('${esc(pl.id)}')">刷新</button><button class="btn del" onclick="removeCur('${esc(pl.id)}')">删除</button>`;
+    const sub = builtin ? esc(pl.desc||"") : `来自 ${esc(srcName(pl.source))} · ${pl.track_count||0} 首`;
+    const tag = builtin ? `<span class="mtag">内置</span>` : "";
+    return `<div class="pl-manage-row" data-id="${esc(pl.id)}">
+      <div class="dh" title="按住拖动调整顺序">⋮⋮</div>
+      <div class="mic">${builtin ? (pl.id==="xd"?"💖":"📀") : srcEmoji(pl.source)}</div>
+      <div class="mmeta"><div class="mnm">${tag}${esc(pl.name)}</div><div class="mst">${sub}</div></div>
+      ${ctrl}
+      ${right}
+    </div>`;
+  }).join("");
+  const body = list.length
+    ? `<div class="manage-list" id="curList">${rows}</div>`
+    : `<div class="empty">当前歌单为空。</div>`;
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">📂</span><span>当前歌单</span></div>${badge(list.length?"ok":"off", list.length+" 个已载入")}</div>
+    <div class="desc"><b>按住左侧 ⋮⋮ 拖动</b>即可调整全部歌单的顺序（含内置的「每日推荐」），顺序即飞牛音乐内展示顺序；
+      已加入的歌单还可停用或删除。</div>
+    <div class="manage-list">${body}</div>
+    <div class="actions"><button class="btn" onclick="loadAll()">刷新</button></div>
+  </div>`;
+}
+function renderSrcGroup(s){
+  const pls = s.playlists||[];
+  const rows = pls.map(pl=>{
+    const added = isAdded(s.key, String(pl.id));
+    return `<div class="pl-src-row" data-name="${esc(pl.name)}">
+      <div class="mic">🎵</div>
+      <div class="mmeta"><div class="mnm">${esc(pl.name)}</div><div class="mst">${esc(s.name)} · ID ${esc(pl.id)}</div></div>
+      <button class="btn primary" ${added?"disabled":""} onclick="addToCur('${s.key}','${esc(String(pl.id))}','${esc(pl.name)}')">${added?"已加入":"加入当前歌单"}</button>
+    </div>`;
+  }).join("");
+  const body = pls.length ? rows : `<div class="empty">${esc(s.note||"该音源暂无可浏览歌单列表。")}</div>`;
+  // 列表较长（网易云 63 / 酷我 36）时提供置顶搜索框，滚动时保持可见
+  const toolbar = pls.length > 8 ? `<div class="list-toolbar">
+      <input class="filter" id="plFilter" placeholder="搜索歌单名称…" value="${esc(STATE.plFilter||"")}"
+             oninput="filterPls(this.value)">
+      <span class="count" id="plCount">${pls.length} 个</span>
+    </div>` : "";
+  return `<div class="panel">
+    <div class="ph"><div class="ttl"><span class="em">${srcEmoji(s.key)}</span><span>${esc(s.name)} 歌单</span></div>${s.enabled?badge("ok","已启用"):badge("off","已关闭")}</div>
+    <div class="desc">${esc(s.note || "浏览该音源歌单（列表较长，可在此区域内上下滑动），点击「加入当前歌单」即可载入飞牛音乐。")}</div>
+    ${toolbar}
+    <div class="manage-list">${body}</div>
+    <div class="actions"><button class="btn" onclick="loadAll()">刷新</button></div>
+  </div>`;
+}
+/* 长歌单列表过滤：纯 DOM 显隐，不整体重渲染（避免输入框失焦） */
+function filterPls(q){
+  STATE.plFilter = q || "";
+  const rows = document.querySelectorAll(".pl-src-row");
+  const key = (q||"").trim().toLowerCase();
+  let n = 0;
+  rows.forEach(r=>{
+    const nm = (r.getAttribute("data-name") || "").toLowerCase();
+    const hit = !key || nm.indexOf(key) >= 0;
+    r.style.display = hit ? "" : "none";
+    if(hit) n++;
+  });
+  const c = document.getElementById("plCount");
+  if(c) c.textContent = key ? (n + " / " + rows.length + " 个") : (rows.length + " 个");
+}
+function restorePlFilter(){
+  if(!STATE.plFilter) return;
+  const el = document.getElementById("plFilter");
+  if(el) filterPls(STATE.plFilter);
+}
+async function applyReorder(ids){
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({action:"reorder", ids})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"失败");
+    STATE.playlists.current = d.current; toast("顺序已保存"); renderPlaylists();
+  }catch(e){ toast("排序失败: "+(e.message||e),"err"); await loadAll(); }
+}
+async function toggleCur(box){
+  const id = box.getAttribute("data-id"); const on = box.checked; box.disabled=true;
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({action:"toggle", id, enabled:on})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"失败");
+    STATE.playlists.current = d.current; toast(on?"已启用":"已停用"); renderPlaylists();
+  }catch(e){ box.checked=!on; toast("操作失败: "+(e.message||e),"err"); }
+  finally{ box.disabled=false; }
+}
+async function removeCur(id){
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({action:"remove", id})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"失败");
+    STATE.playlists.current = d.current; toast("已删除"); renderPlaylists();
+  }catch(e){ toast("删除失败: "+(e.message||e),"err"); }
+}
+async function refreshCur(id){
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({action:"refresh", id})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"失败");
+    toast(d.msg||"已清除缓存");
+  }catch(e){ toast("刷新失败: "+(e.message||e),"err"); }
+}
+async function addToCur(source, source_id, name, cover){
+  try{
+    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({action:"add", source, source_id, name, cover: cover||""})});
+    const d = await r.json();
+    if(d.code!==0) throw new Error(d.msg||"失败");
+    STATE.playlists.current = d.current; toast("已加入当前歌单"); renderPlaylists();
+  }catch(e){ toast("加入失败: "+(e.message||e),"err"); }
+}
+
+/* ============ 拖拽排序（指针事件实现：鼠标 + 触摸通用） ============ */
+function initDragSort(container, opts){
+  if(!container) return;
+  container.querySelectorAll(opts.itemSel).forEach(el=>{
+    const h = el.querySelector(".dh");
+    if(!h || h.dataset.dragBound === "1") return;
+    h.dataset.dragBound = "1";
+    h.addEventListener("pointerdown", e=>{
+      if(typeof e.button === "number" && e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      startDragSort(container, el, opts, e);
+    });
+  });
+}
+function startDragSort(container, el, opts, ev){
+  el.classList.add("dragging");
+  const startY = ev.clientY;
+  let moved = false;
+  const onMove = e=>{
+    if(!moved && Math.abs(e.clientY - startY) < 3) return;
+    moved = true;
+    const y = e.clientY;
+    const sibs = Array.from(container.querySelectorAll(opts.itemSel));
+    const er = el.getBoundingClientRect();
+    for(const sib of sibs){
+      if(sib === el) continue;
+      const r = sib.getBoundingClientRect();
+      const mid = r.top + (r.height / 2);
+      if(er.top < r.top && y > mid){ container.insertBefore(el, sib.nextSibling); break; }
+      if(er.top > r.top && y < mid){ container.insertBefore(el, sib); break; }
+    }
+  };
+  const onUp = ()=>{
+    document.removeEventListener("pointermove", onMove);
+    document.removeEventListener("pointerup", onUp);
+    document.removeEventListener("pointercancel", onUp);
+    el.classList.remove("dragging");
+    if(moved){
+      const keys = Array.from(container.querySelectorAll(opts.itemSel))
+        .map(x => opts.getKey(x)).filter(Boolean);
+      opts.onCommit(keys);
+    }
+  };
+  document.addEventListener("pointermove", onMove);
+  document.addEventListener("pointerup", onUp);
+  document.addEventListener("pointercancel", onUp);
+}
+
+/* ============ 公共 ============ */
+/* 手机端：向导栏已改为底部 Tab Bar，内容是单列整页滚动，
+   详情面板在列表下方、选中后可能落在屏幕外 —— 窄屏自动滚动过去，避免「点了像没反应」。*/
+function isNarrow(){ return !!(window.matchMedia && window.matchMedia("(max-width:860px)").matches); }
+function scrollToDetail(){
+  if(!isNarrow()) return;
+  const el = document.getElementById("detailCol");
+  if(el) requestAnimationFrame(()=>{ try{ el.scrollIntoView({behavior:"smooth", block:"start"}); }catch(e){ el.scrollIntoView(); } });
+}
+function badge(cls,txt){ return `<span class="badge ${cls}">${txt}</span>`; }
+function healthBadge(h){
+  if(h==="ok") return badge("ok","正常");
+  if(h==="disabled") return badge("off","已关闭");
+  if(h==="unreachable") return badge("bad","不可达");
+  if(h==="fail") return badge("bad","异常");
+  return badge("off","未知");
+}
+function updateFoot(){
+  const s = STATE.sources; if(!s||s.code!==0) return;
+  const ne = s.netease; const dot=document.getElementById("foot-dot"); const txt=document.getElementById("foot-txt");
+  let cls="none", t="未知";
+  if(ne && ne.logged_in){ cls="ok"; t="网易云已连接"; } else { cls="off"; t="网易云未连接"; }
+  dot.className="dot "+cls; txt.textContent=t;
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+</script>
+</body>
+</html>

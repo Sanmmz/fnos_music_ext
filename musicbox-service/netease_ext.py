@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Any
 
 _api_lock = threading.Lock()
@@ -53,14 +54,79 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def check_is_logged_in() -> bool:
+# ---- v75 self-healing login probe ----
+_LOGIN_STATE = {"ts": 0.0, "val": None}
+_LOGIN_TTL_OK = 300.0
+_LOGIN_TTL_BAD = 60.0
+
+
+def _reset_api_instance():
+    """Drop the cached NetEase() instance so the next call re-reads the cookie file."""
+    global _api_instance
+    with _api_lock:
+        _api_instance = None
+    return _get_api()
+
+
+def _cli_auth_logged_in():
+    """Last resort: ask the musicbox CLI (fresh process, reads cookie from disk)."""
+    try:
+        import json as _json
+
+        from runner import run_musicbox as _run
+
+        code, out, _err = _run(["auth", "status", "--json"], timeout=25.0)
+        if code != 0:
+            return None
+        payload = _json.loads(out or "{}")
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = payload
+        if isinstance(data, dict) and "logged_in" in data:
+            return bool(data.get("logged_in"))
+    except Exception:
+        return None
+    return None
+
+
+def _probe_logged_in() -> bool:
+    # 1) the cached in-process instance
     try:
         api = _get_api()
         with _api_lock:
             info = api.get_account_info()
-        return bool(info and (info.get("account") or info.get("profile")))
+        if info and (info.get("account") or info.get("profile")):
+            return True
     except Exception:
-        return False
+        pass
+    # 2) rebuild the instance -- the cookie file may have been refreshed after startup
+    try:
+        api = _reset_api_instance()
+        with _api_lock:
+            info = api.get_account_info()
+        if info and (info.get("account") or info.get("profile")):
+            return True
+    except Exception:
+        pass
+    # 3) fall back to the CLI subprocess
+    return bool(_cli_auth_logged_in())
+
+
+def check_is_logged_in() -> bool:
+    """Cached login probe with self healing (v75)."""
+    now = time.time()
+    cached = _LOGIN_STATE.get("val")
+    ts = float(_LOGIN_STATE.get("ts") or 0.0)
+    ttl = _LOGIN_TTL_OK if cached else _LOGIN_TTL_BAD
+    if cached is not None and (now - ts) < ttl:
+        return bool(cached)
+    val = bool(_probe_logged_in())
+    _LOGIN_STATE["val"] = val
+    _LOGIN_STATE["ts"] = now
+    return val
+# ---- end v75 ----
 
 
 def filter_playable_song_ids(ids: list[int]) -> set[int]:

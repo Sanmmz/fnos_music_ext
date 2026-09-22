@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as _html
 import math
 import json
 import logging
 import os
 import re
 import shutil
+import shlex
 import sqlite3
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Callable, Coroutine
@@ -27,7 +30,7 @@ from uuid import uuid4
 import httpx
 import anyio
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 try:
     from . import recommend as dailyrec
@@ -47,8 +50,16 @@ CONF = {
     "musicdl_url": os.environ.get("FNMUSIC_MUSICDL_URL", "http://127.0.0.1:8768"),
     "musicbox_url": os.environ.get("FNMUSIC_MUSICBOX_URL", "http://127.0.0.1:8770"),
     "lx_url": os.environ.get("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
+    # v76 喜马拉雅音源（专属容器 xmly-service，宿主机 8774 -> 容器 8000）
+    # 一个专辑 = 一部小说 = App 里的一个歌单；VIP 取流依赖扫码登录后的 cookie
+    "xmly_url": os.environ.get("FNMUSIC_XMLY_URL", "http://127.0.0.1:8774"),
+    "xmly_enabled": os.environ.get("FNMUSIC_XMLY_ENABLED", "true").lower() in ("true", "1", "yes"),
     "musicdl_enabled": os.environ.get("FNMUSIC_MUSICDL_ENABLED", "true").lower() in ("true", "1", "yes"),
     "netease_enabled": os.environ.get("FNMUSIC_NETEASE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    # v56 心动·华语流行歌单总开关（仅当网易云启用时生效）
+    "xd_enabled": os.environ.get("FNMUSIC_XD_ENABLED", "true").lower() in ("true", "1", "yes"),
+    # v57 管理控制台独立 TCP 端口（绕过 fnOS Nginx，直接局域网访问）
+    "admin_port": int(os.environ.get("FNMUSIC_ADMIN_PORT", "8799") or 8799),
     "lx_enabled": os.environ.get("FNMUSIC_LX_ENABLED", "true").lower() in ("true", "1", "yes"),
     "lx_search_limit": int(os.environ.get("FNMUSIC_LX_SEARCH_LIMIT", "20")),
     "lx_quality": os.environ.get("FNMUSIC_LX_QUALITY", "lossless"),
@@ -63,7 +74,9 @@ CONF = {
     ),
     "stream_url_ttl": float(os.environ.get("FNMUSIC_STREAM_URL_TTL", "600")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
-    "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "30")),
+    # v74：首页在线结果条数 30 → 50。
+    # 实测 musicbox 网易单次约 20 条、lx 约 20 条，30 的容量必然挤掉其中一方。
+    "online_limit": int(os.environ.get("FNMUSIC_ONLINE_LIMIT", "50")),
     "search_list_path": os.environ.get("FNMUSIC_SEARCH_LIST_PATH", "data.list"),
     "cache_dir": os.environ.get("FNMUSIC_CACHE_DIR", os.path.join(_HOME, "cache")),
     # 空=从飞牛 shared_library.path 自动探测；测试可覆盖到临时目录
@@ -78,6 +91,8 @@ CONF = {
     "tee_cache_max": int(os.environ.get("FNMUSIC_TEE_CACHE_MAX", "2")),
     "merge_suggest": os.environ.get("FNMUSIC_MERGE_SUGGEST", "false").lower() in ("true", "1", "yes"),
     "online_sources": os.environ.get("FNMUSIC_ONLINE_SOURCES", "KuwoMusicClient,MiguMusicClient"),
+    # v59 音源搜索优先顺序（逗号分隔；搜索按此顺序优先调用，结果也优先展示）
+    "source_order": [s.strip().lower() for s in str(os.environ.get("FNMUSIC_SOURCE_ORDER", "netease,lx,musicdl")).split(",") if s.strip()],
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -204,9 +219,13 @@ def _search_scope(request: Request) -> str:
 
 def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
-    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled"), True):
+    # v76: xmly 是独立音源，必须单独判断，不能掉进 musicdl 的 online_sources 规则里，
+    #      否则 FNMUSIC_ONLINE_SOURCES 没配 xmly 时喜马拉雅曲目会被判成「已停用音源」
+    #      而只返回 retained（Empty title ⇒ 手机端整列不渲染）。
+    if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled",
+                     "xmly": "xmly_enabled"}.get(source, "musicdl_enabled"), True):
         return False
-    if source not in ("netease", "lx") and CONF.get("online_sources"):
+    if source not in ("netease", "lx", "xmly") and CONF.get("online_sources"):
         selected = {name.strip().lower().removesuffix("musicclient") for name in str(CONF["online_sources"]).split(",")}
         return source.lower() in selected
     return True
@@ -1277,14 +1296,136 @@ async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: i
     return None
 
 
+_MB_LOGIN_CACHE = {"ts": 0.0, "val": None}
+
+
+async def _musicbox_logged_in(client) -> bool | None:
+    """探测 musicbox **进程内**的网易云登录态（结果缓存 10 分钟）。
+
+    注意：不能用 /api/v1/auth/status 代替 —— 它走 CLI 子进程、每次重读磁盘
+    cookie，登录态失效时仍会返回 true；只有 /api/v1/recommend/songs 返回的
+    logged_in 才是 uvicorn 进程内的真实判定。
+    """
+    import time as _t
+
+    c = _MB_LOGIN_CACHE
+    try:
+        if c["val"] is not None and (_t.time() - float(c["ts"] or 0.0)) < 600.0:
+            return c["val"]
+    except Exception:
+        pass
+    try:
+        r = await client.get("/api/v1/recommend/songs", params={"limit": 10}, timeout=8.0)
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, dict) and "logged_in" in j:
+                c["val"] = bool(j.get("logged_in"))
+                c["ts"] = _t.time()
+                return c["val"]
+    except Exception:
+        pass
+    return None
+
+
+# ---- v75b: musicbox 搜索长尾对冲 + 结果缓存 ----
+_MB_HEDGE_S = float(os.environ.get("FNMUSIC_MB_HEDGE_S", "0"))
+_MB_HARD_S = float(os.environ.get("FNMUSIC_MB_HARD_S", "28.0"))
+_MB_SEARCH_CACHE: dict = {}
+_MB_SEARCH_CACHE_MAX = 300
+
+
+def _mb_cache_get(key):
+    try:
+        e = _MB_SEARCH_CACHE.get(key)
+        if not e:
+            return None
+        if time.time() - float(e.get("ts") or 0.0) > float(e.get("ttl") or 0.0):
+            _MB_SEARCH_CACHE.pop(key, None)
+            return None
+        return e.get("items")
+    except Exception:
+        return None
+
+
+def _mb_cache_put(key, items):
+    try:
+        n = max(5, int(int(key[1]) * 0.4)) if len(key) > 1 else 5
+        ttl = 600.0 if items and len(items) >= n else 60.0
+        if len(_MB_SEARCH_CACHE) > _MB_SEARCH_CACHE_MAX:
+            for k in sorted(_MB_SEARCH_CACHE, key=lambda k: float(_MB_SEARCH_CACHE[k].get("ts") or 0.0))[:100]:
+                _MB_SEARCH_CACHE.pop(k, None)
+        _MB_SEARCH_CACHE[key] = {"ts": time.time(), "items": list(items), "ttl": ttl}
+    except Exception:
+        pass
+
+
 async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
+    """网易云搜索：缓存优先，慢请求对冲（第二个请求 3s 后才发）。"""
+    if not keyword:
+        return None
+    key = (str(keyword), int(limit or 0))
+    cached = _mb_cache_get(key)
+    if cached is not None:
+        return list(cached)
+    t1 = asyncio.ensure_future(_fetch_musicbox_search_once(client, keyword, limit))
+    tasks = [t1]
+    try:
+        if _MB_HEDGE_S > 0:
+            await asyncio.wait({t1}, timeout=_MB_HEDGE_S)
+            if not t1.done():
+                t2 = asyncio.ensure_future(_fetch_musicbox_search_once(client, keyword, limit))
+                tasks.append(t2)
+                await asyncio.wait(
+                    {t1, t2}, return_when=asyncio.FIRST_COMPLETED,
+                    timeout=max(2.0, _MB_HARD_S - _MB_HEDGE_S),
+                )
+        else:
+            await asyncio.wait({t1}, timeout=_MB_HARD_S)
+    except Exception:
+        pass
+
+    res = None
+    for t in tasks:
+        if t.done():
+            try:
+                r = t.result()
+            except Exception:
+                r = None
+            if r:
+                res = r
+                break
+    if res is None:
+        pend = [t for t in tasks if not t.done()]
+        if pend:
+            try:
+                await asyncio.wait(set(pend), timeout=6.0)
+            except Exception:
+                pass
+            for t in pend:
+                if t.done():
+                    try:
+                        r = t.result()
+                    except Exception:
+                        r = None
+                    if r:
+                        res = r
+                        break
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    if res:
+        _mb_cache_put(key, res)
+    return res
+
+
+async def _fetch_musicbox_search_once(client: httpx.AsyncClient, keyword: str, limit: int) -> list[dict] | None:
     if not keyword:
         return None
     try:
         r = await client.get(
             "/api/v1/search",
             params={"keyword": keyword, "limit": limit, "type": "song"},
-            timeout=20.0,
+            timeout=28.0,
         )
         if r.status_code != 200:
             return None
@@ -1358,7 +1499,19 @@ async def fetch_musicbox_search(client: httpx.AsyncClient, keyword: str, limit: 
             except Exception as detail_err:
                 logger.warning("Failed to fetch songs detail for %s: %s", keyword, detail_err)
 
-        return [it for it in items if is_playable_online_track(it)]
+        kept = [it for it in items if is_playable_online_track(it)]
+        try:
+            _probe_write("[mbs] kw=%s req_limit=%s raw=%d built=%d kept=%d" % (
+                keyword, limit, len(raw_list), len(items), len(kept)))
+            if limit >= 20 and len(kept) * 5 < limit:
+                _li = await _musicbox_logged_in(client)
+                logger.warning(
+                    "[mbs] 网易云结果偏少 kw=%s req_limit=%s kept=%d musicbox_logged_in=%s "
+                    "(false 表示 musicbox 进程内网易云登录态失效，VIP/付费曲目被整批剔除)",
+                    keyword, limit, len(kept), _li)
+        except Exception:
+            pass
+        return kept
     except Exception as e:
         logger.warning("Failed to fetch musicbox search: %s", e)
         return None
@@ -2137,8 +2290,7 @@ async def ext_livez():
     return {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
 
 
-@app.get("/_ext/healthz")
-async def ext_healthz(request: Request):
+async def _ext_healthz_core(application) -> dict:
     async def probe(name: str, client: httpx.AsyncClient, path: str) -> dict:
         try:
             response = await asyncio.wait_for(client.get(path, timeout=2.0), timeout=2.4)
@@ -2165,7 +2317,7 @@ async def ext_healthz(request: Request):
               ("musicbox", CONF.get("netease_enabled", True), get_musicbox_client, "/healthz"),
               ("lxmusic", CONF.get("lx_enabled", True), get_lx_client, "/healthz")]
     enabled = [(name, getter, path) for name, on, getter, path in checks if on]
-    results = await asyncio.gather(*(probe(name, getter(request.app), path) for name, getter, path in enabled))
+    results = await asyncio.gather(*(probe(name, getter(application), path) for name, getter, path in enabled))
     details = {name: {"status": "disabled"} for name, on, _, _ in checks if not on}
     details.update({name: result for (name, _, _), result in zip(enabled, results)})
     statuses = {name: value["status"] for name, value in details.items()}
@@ -2182,6 +2334,11 @@ async def ext_healthz(request: Request):
                 "recent": dailyrec.last_recommend_summary(),
             },
             "degraded": bool(failed), "failures": failed, "details": details}
+
+
+@app.get("/_ext/healthz")
+async def ext_healthz(request: Request):
+    return await _ext_healthz_core(request.app)
 
 
 # === v55: 搜索结果「有海报 + 高音质」优先 ===
@@ -2278,8 +2435,45 @@ def _search_item_has_poster(item: dict) -> bool:
         return False
 
 
+def _search_item_source_rank(item: dict) -> int:
+    """音源搜索优先档：数值越小优先级越高（排在前面）。未知音源排最后。"""
+    order = CONF.get("source_order") or ["netease", "lx", "musicdl"]
+    src = (item or {}).get("_src")
+    if not src or src not in order:
+        return 99
+    return order.index(src)
+
+
+def _search_preferred_sources() -> list:
+    """v74：首页愿意「多等一会儿」的音源 —— source_order 里**第一个已启用**的音源。
+
+    网易是用户默认最想要的音源，而它偏偏最慢（musicbox 实测 4~6s），
+    所以这里只盯住排在最前面的那一个，别把等待预算摊薄给所有音源。
+    """
+    order = CONF.get("source_order") or ["netease", "lx", "musicdl"]
+    for n in order:
+        if n == "netease" and CONF.get("netease_enabled", True):
+            return [n]
+        if n == "lx" and CONF.get("lx_enabled", True):
+            return [n]
+        if n == "musicdl" and CONF.get("musicdl_enabled", True):
+            return [n]
+    return []
+
+
+def _search_preferred_done(entry: dict) -> bool:
+    """v74：首选音源是否已经返回（含「返回了但是 0 条」—— 那也不用再等）。"""
+    want = _search_preferred_sources()
+    if not want:
+        return True
+    done = entry.get("src_done")
+    if not isinstance(done, (set, list, tuple)):
+        return False
+    return all(w in done for w in want)
+
+
 def rank_search_items(items: list[dict], mode: str | None = None) -> list[dict]:
-    """稳定重排在线搜索结果：有海报 + 高音质优先。
+    """稳定重排在线搜索结果：有海报 + 高音质优先；同档按音源优先顺序置顶。
 
     mode=cover_quality（默认）海报优先，同档再比音质；
     mode=quality_cover 音质优先，同档再比海报；
@@ -2293,9 +2487,10 @@ def rank_search_items(items: list[dict], mode: str | None = None) -> list[dict]:
         idx, it = pair
         poster = 1 if _search_item_has_poster(it) else 0
         quality = _search_item_quality_rank(it)
+        src = _search_item_source_rank(it)
         if mode == "quality_cover":
-            return (-quality, -poster, idx)
-        return (-poster, -quality, idx)
+            return (-quality, -poster, src, idx)
+        return (-poster, -quality, src, idx)
 
     return [it for _idx, it in sorted(enumerate(items), key=sort_key)]
 
@@ -2571,6 +2766,12 @@ async def _enrich_search_items(items: list, cap: int = 30) -> int:
 @app.get("/music/api/v1/search/track")
 @app.get("/music/api/v1/search/track/{subpath:path}")
 async def search_track(request: Request):
+    # v76：带触发词（「小说 xxx」）时**只**走喜马拉雅，不再问 MusicDL/网易/洛雪。
+    # 用户明确要求：有了关键词「小说」，就只调用喜马拉雅接口。
+    _xmly_kw = _xmly_trigger(extract_keyword(request))
+    if _xmly_kw and CONF.get("xmly_enabled", True):
+        return await _xmly_search_track_response(request, _xmly_kw)
+
     upstream_client = get_upstream_client(request.app)
     musicdl_client = get_musicdl_client(request.app)
     musicbox_client = get_musicbox_client(request.app)
@@ -2641,13 +2842,27 @@ async def search_track(request: Request):
     if task and not task.done():
         if page == 1:
             await asyncio.wait({task}, timeout=float(CONF["netease_wait_s"]))
-            # Empty/error completions do not exhaust the remaining wait budget.
-            if not entry["items"]:
+            # v74 ★ 核心修复：续等条件加上「首选音源还没回来」。
+            # 旧条件是 `if not entry["items"]` —— 只要 lx 先返回（items 非空）就立刻收工，
+            # 而 musicbox 网易实测要 4~6s（netease_wait_s 只有 3s）⇒ 网易结果永远进不了首屏，
+            # 表现就是「网易明明有这首歌，App 里却搜不到」。
+            # 实测：起风了 首屏 netease 仅 8 条、刘惜君 0 条，位置全被 lx 占掉。
+            # 预算不変（netease_wait_s + late_page_wait_s，最多仍是 8s），只是不再白白放弃。
+            if not entry["items"] or not _search_preferred_done(entry):
                 deadline = asyncio.get_running_loop().time() + float(CONF["late_page_wait_s"])
-                while not entry["items"] and not task.done() and asyncio.get_running_loop().time() < deadline:
+                while ((not entry["items"] or not _search_preferred_done(entry))
+                       and not task.done()
+                       and asyncio.get_running_loop().time() < deadline):
                     await asyncio.wait({task}, timeout=min(0.02, max(0, deadline - asyncio.get_running_loop().time())))
         else:
             await asyncio.wait({task}, timeout=float(CONF["late_page_wait_s"]))
+    try:
+        _probe_write("[searchwait] kw=%s page=%d items=%d src_done=%s pref_done=%s task_done=%s" % (
+            keyword, page, len(entry.get("items") or []),
+            ",".join(sorted(entry.get("src_done") or [])) or "-",
+            _search_preferred_done(entry), (task.done() if task else None)))
+    except Exception:
+        pass
     if _search_rank_enabled() and task is not None and not task.done() and entry["items"] and not entry["pages"]:
         # v55: 首页再多等一小会儿，让「补全封面/音质 → 重排」在页码分配之前完成。
         # 页码一旦分配就按 guid 固定，之后重排也改不了首屏顺序。
@@ -2680,14 +2895,107 @@ async def search_track(request: Request):
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
+async def _xmly_search_track_response(request: Request, keyword: str):
+    """search/track 的喜马拉雅专用分支。
+
+    一行 = 一部小说 = 一个歌单（点开就播第 1 集；完整章节由「歌单」维度承载）。
+    这里不复用普通搜索那一套「先问上游再合并」的流程：
+      1. 上游本地曲库里不会有喜马拉雅内容，白跑一趟还要等；
+      2. 用户要求「有关键词就只调喜马拉雅」。
+    """
+    try:
+        size = int(request.query_params.get("size") or 50)
+    except (TypeError, ValueError):
+        size = 50
+    albums = await _xmly_search_albums(keyword, limit=max(1, min(size, 20)))
+    rows: list[dict] = []
+    # 并发取每个专辑的第 1 集，避免串行带来的 20 × RT 延迟
+    # ★ max_pages=1：只取第一页（30 条）就够定位第一章，
+    #   绝不在这里拉满整张专辑（一部小说可能上千集）
+    details = await asyncio.gather(*[_xmly_album_rows(a["albumId"], max_pages=1,
+                                                      cache_only_first_page=True)
+                                     for a in albums],
+                                   return_exceptions=True)
+    for album, got in zip(albums, details):
+        rows0 = got if isinstance(got, list) else []
+        if not rows0:
+            continue
+        item = _xmly_row_to_item(rows0[0], album)
+        # 标题用专辑名（用户搜的是小说名，不是第 1 集的章节名）
+        item["title"] = str(album.get("title") or item["title"])
+        item["artist"] = str(album.get("author") or item["artist"] or "喜马拉雅")
+        item["album"] = str(album.get("title") or item["album"])
+        item["cover_url"] = _xmly_abs_cover(str(album.get("cover") or item["cover_url"] or ""))
+        item["duration_s"] = int(rows0[0].get("duration") or 0)
+        try:
+            rows.append(build_online_track(item))
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        _prefetch_online_covers(rows)
+    except Exception:  # noqa: BLE001
+        pass
+    payload = {"code": 0, "msg": "ok", "data": {"list": rows, "total": len(rows), "page": 1,
+                                                "size": size, "source": "xmly"}}
+    return JSONResponse(content=payload)
+
+
+@app.get("/music/api/v1/search/playlist")
+@app.get("/music/api/v1/search/playlist/{subpath:path}")
+async def search_playlist(request: Request):
+    """搜「歌单」命中触发词时，把喜马拉雅专辑当歌单返回（一部小说 = 一个歌单）。"""
+    kw = _xmly_trigger(extract_keyword(request))
+    if not kw or not CONF.get("xmly_enabled", True):
+        return await forward_to_upstream(request, get_upstream_client(request.app))
+    try:
+        size = int(request.query_params.get("size") or 20)
+    except (TypeError, ValueError):
+        size = 20
+    albums = await _xmly_search_albums(kw, limit=max(1, min(size, 30)))
+    ts = int(time.time())
+    recs = []
+    for a in albums:
+        aid = str(a.get("albumId"))
+        pguid = XMLY_PLAYLIST_PREFIX + aid
+        # ★ coverId 必须用 guid（见 _xmly_album_to_playlist_record 的说明）：
+        #   填外链 URL 会让 App 的封面请求解析失败 ⇒ 歌单海报全白。
+        _cv = _xmly_abs_cover(str(a.get("cover") or ""))
+        if _cv:
+            _warm_xmly_poster(pguid, _cv)
+        recs.append({
+            "guid": pguid,
+            "name": str(a.get("title") or "喜马拉雅专辑"),
+            "coverId": pguid,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "trackCount": int(a.get("trackCount") or 0),
+            "isDaily": False,
+        })
+    return JSONResponse(content={"code": 0, "msg": "ok",
+                                 "data": {"list": recs, "total": len(recs), "source": "xmly"}})
+
+
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
-    sources = []
-    if CONF.get("netease_enabled", True):
-        sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
-    if CONF.get("musicdl_enabled", True):
-        sources.append(fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"]))
-    if CONF.get("lx_enabled", True):
-        sources.append(fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"]))
+    order = CONF.get("source_order") or ["netease", "lx", "musicdl"]
+
+    def _spec(name):
+        if name == "netease" and CONF.get("netease_enabled", True):
+            return fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"])
+        if name == "musicdl" and CONF.get("musicdl_enabled", True):
+            return fetch_musicdl_search(get_musicdl_client(request.app), keyword, CONF["online_limit"])
+        if name == "lx" and CONF.get("lx_enabled", True):
+            return fetch_lx_search(get_lx_client(request.app), keyword, CONF["lx_search_limit"])
+        return None
+
+    # v59 按 source_order 优先调用（未列入顺序的音源排到最后）
+    specs = [(n, _spec(n)) for n in order if _spec(n) is not None]
+    for n in ("netease", "lx", "musicdl"):
+        if n not in order:
+            c = _spec(n)
+            if c is not None:
+                specs.append((n, c))
+    source_names = [n for n, _ in specs]
+    sources = [c for _, c in specs]
     tasks = [asyncio.create_task(coro) for coro in sources]
     pending = set(tasks)
     partial = False
@@ -2709,7 +3017,27 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     data = None
                 partial |= data is None or bool(getattr(data, "partial", False)) or (isinstance(data, dict) and bool(data.get("errors") or data.get("ok") is False))
                 items = data.get("items", []) if isinstance(data, dict) else (data or [])
+                # v59 标注来源，供搜索排序按优先音源置顶
+                src = source_names[tasks.index(task)] if task in tasks else None
+                if src:
+                    for it in items:
+                        if isinstance(it, dict) and "_src" not in it:
+                            it["_src"] = src
                 results[task] = items
+                try:
+                    _probe_write("[searchsrc] kw=%s src=%s n=%d pool=%d pages=%s" % (
+                        keyword, src, len(items), len(entry.get("items") or []),
+                        "y" if entry.get("pages") else "n"))
+                except Exception:
+                    pass
+                # v74：记下「哪个音源已经回来了」，首页据此决定要不要再等等首选音源。
+                # ★ 即使返回 0 条也要记 —— 那是「确实没有」，再等也是白等。
+                if src:
+                    _sd = entry.get("src_done")
+                    if not isinstance(_sd, set):
+                        _sd = set()
+                        entry["src_done"] = _sd
+                    _sd.add(src)
                 if not entry["pages"]:
                     ordered = [item for source_task in tasks for item in results.get(source_task, [])]
                 else:
@@ -3088,6 +3416,36 @@ async def _recover_source(request: Request, guid: str, entry: dict | None) -> bo
         return False
 
 
+_XMLY_URL_CACHE: dict[str, tuple] = {}
+_XMLY_URL_TTL = 1800.0
+
+
+async def _resolve_xmly_url(album_id: str, track_id: str) -> tuple[str, str]:
+    """向 xmly-service 取已解密的音频直链，返回 (url, ext)。
+
+    xmly-service 侧自带 30 分钟缓存；这里是进程内的二次缓存（同 xmly 服务一样为 30 分钟）。
+    """
+    aid, tid = str(album_id or "").strip(), str(track_id or "").strip()
+    if not aid or not tid:
+        return "", "m4a"
+    key = aid + ":" + tid
+    hit = _XMLY_URL_CACHE.get(key)
+    if hit and time.time() - hit[0] < _XMLY_URL_TTL:
+        return hit[1], hit[2]
+    j = await _xmly_aget("/api/v1/track/url", {"albumId": aid, "trackId": tid}, timeout=30.0)
+    url = str(j.get("url") or "")
+    if not j.get("ok") or not url:
+        logger.warning("xmly resolve url failed aid=%s tid=%s msg=%s", aid, tid, j.get("msg"))
+        return "", "m4a"
+    ext = str(j.get("ext") or "m4a")
+    _XMLY_URL_CACHE[key] = (time.time(), url, ext)
+    return url, ext
+
+
+_XMLY_URL_CACHE: dict[str, tuple] = {}
+_XMLY_URL_TTL = 1800.0
+
+
 async def _open_online_stream(request: Request, guid: str, range_header: str | None):
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
@@ -3099,8 +3457,17 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     resp = None
     ext = None
     try:
-        if source in ("netease", "lx"):
-            if source == "netease":
+        if source in ("netease", "lx", "xmly"):
+            if source == "xmly":
+                # v76 喜马拉雅：xmly-service 已解出真实音频直链（含 VIP 签名），直接下发
+                aid, tid = _xmly_track_ids(guid)
+                if not aid or not tid:
+                    return None
+                url, got_ext = await _resolve_xmly_url(aid, tid)
+                if not url:
+                    return None
+                ext = got_ext
+            elif source == "netease":
                 url = await resolve_netease_url(get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
                 if not url:
                     return None
@@ -3308,6 +3675,34 @@ async def _online_info_raw(request: Request, guid: str) -> dict | None:
 
 async def _fetch_online_info(request: Request, guid: str) -> dict | None:
     src = source_from_online_guid(guid)
+    if src == "xmly":
+        # v76 喜马拉雅：命中专辑缓存时零请求（歌单打开过一次，之后封面/时长都是本地现成的）
+        aid, tid = _xmly_track_ids(guid)
+        if not tid:
+            return None
+        cache = _XMLY_ALBUM_CACHE.get(aid) if aid else None
+        row = (cache or {}).get("by_id", {}).get(tid) if cache else None
+        if row is None:
+            # 没缓存：直接问 xmly-service 的单集接口（它自己也会返回 title/cover/duration）
+            j = await _xmly_aget("/api/v1/track/url", {"albumId": aid, "trackId": tid}, timeout=20.0)
+            if not j.get("ok"):
+                return None
+            return {
+                "title": str(j.get("title") or ""),
+                "artist": str((cache or {}).get("author") or "喜马拉雅"),
+                "album": str((cache or {}).get("title") or ""),
+                "cover_url": _xmly_abs_cover(str(j.get("cover") or "")),
+                "duration_s": int(j.get("duration") or 0),
+                "ext": str(j.get("ext") or "m4a"),
+            }
+        return {
+            "title": str(row.get("title") or ""),
+            "artist": str(row.get("anchorName") or "喜马拉雅"),
+            "album": str(row.get("albumTitle") or ""),
+            "cover_url": _xmly_abs_cover(str(row.get("cover") or "")),
+            "duration_s": int(row.get("duration") or 0),
+            "ext": "m4a",
+        }
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
         raw_song_id = song_id_from_online_guid(guid)
@@ -3748,6 +4143,13 @@ def _sized_cover_url(url: str, size: int) -> str:
     if "music.126.net" in u:
         base = u.split("?")[0]
         return base + "?param=%dy%d" % (s, s)
+    if "xmcdn.com" in u:
+        # v77：喜马拉雅图床支持 `!op_type=3&columns=N&rows=N` 现算缩略图。
+        #   实测同一张专辑封面：原图 686KB jpg → 600 缩图 47KB → 300 缩图 15KB。
+        #   ★ 不要加 magick=png（600 时反而膨胀到 492KB）。
+        #   ★ URL 上已有 `!...`（搜索接口返回的就是 290×290+png）时必须先剥掉再拼，
+        #     两段 `!` 会被图床判为非法 → 400 Bad Request。
+        return u.split("!")[0] + "!op_type=3&columns=%d&rows=%d" % (s, s)
     return u
 
 
@@ -4190,6 +4592,42 @@ async def static_cover(request: Request, subpath: str = ""):
     if __hit:
         return Response(content=__hit[0], media_type=__hit[1],
                         headers={"Cache-Control": "public, max-age=604800"})
+    if is_xmly_playlist_guid(guid):
+        # v77 喜马拉雅歌单海报：coverId 用的是**歌单 guid**（online:playlist:xmly:<aid>），
+        # 而 _online_info 只认得曲目 guid（source 取到的是 "playlist" 不是 "xmly"），
+        # 不在这里拦下来就会一路落到占位图 ⇒ 小说搜索的歌单结果全部没有海报。
+        # ★ 同样遵守铁律：绝不能 404 / 返回 JSON（手机端会整块裂图）。
+        _xm_cover = ""
+        try:
+            _xm_cover = _normalize_cover_url(str((_meta_get(guid) or {}).get("cover_url") or ""))
+        except Exception:  # noqa: BLE001
+            _xm_cover = ""
+        if not _xm_cover:
+            _xm_cover = await _xmly_playlist_cover(_xmly_album_id_from_guid(guid))
+        if _xm_cover:
+            try:
+                _meta_set(guid, {"cover_url": _xm_cover})
+            except Exception:  # noqa: BLE001
+                pass
+            _xm_got = await _fetch_image_bytes(_sized_cover_url(_xm_cover, _size))
+            if not _xm_got:
+                _xm_got = await _fetch_image_bytes(_xm_cover)
+            if _xm_got:
+                _cover_by_guid_put(guid, _xm_got[0], _xm_got[1], size=_size)
+                return Response(content=_xm_got[0], media_type=_xm_got[1],
+                                headers={"Cache-Control": "public, max-age=604800"})
+            _xm_fb = _cover_by_guid_get(guid, _size, fallback=True)
+            if _xm_fb:
+                return Response(content=_xm_fb[0], media_type=_xm_fb[1],
+                                headers={"Cache-Control": "public, max-age=604800"})
+        _ph = _placeholder_png_bytes()
+        try:
+            _cover_by_guid_put(guid, _ph, "image/png", ttl=21600)
+        except Exception:  # noqa: BLE001
+            pass
+        return Response(content=_ph, media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=21600"})
+
     data = await _online_info(request, guid)
     cover = (data or {}).get("cover_url") or ""
     cover = _normalize_cover_url(cover)
@@ -4992,7 +5430,32 @@ async def consume_pending_scan(request: Any) -> bool:
     return await _call_library_scan(headers)
 
 
+# v72：手机端进一次歌单页会连打好几个端点，每个都要向上游探一次 user/me。
+# 按 cookie 缓存 5s，省掉重复往返。★ 只缓存「已登录」这个安全结果：
+# 401 / 异常一律不缓存，否则会吞掉真实的鉴权失败。
+_AUTH_PROBE_CACHE: dict = {}
+_AUTH_PROBE_TTL = 5.0
+
+
 async def _probe_upstream_auth(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
+    """带 5s 缓存的登录探测（真正实现见 `_probe_upstream_auth_uncached`）。"""
+    sig = ""
+    try:
+        sig = str(copy_incoming_headers(request).get("cookie") or "")
+        hit = _AUTH_PROBE_CACHE.get(sig)
+        if hit and hit[0] > time.time():
+            return True, hit[1], None
+    except Exception:
+        sig = ""
+    ok, guid, resp = await _probe_upstream_auth_uncached(request, client)
+    if ok and resp is None and sig:
+        if len(_AUTH_PROBE_CACHE) > 200:
+            _AUTH_PROBE_CACHE.clear()
+        _AUTH_PROBE_CACHE[sig] = (time.time() + _AUTH_PROBE_TTL, guid)
+    return ok, guid, resp
+
+
+async def _probe_upstream_auth_uncached(request: Request, client: httpx.AsyncClient) -> tuple[bool, str, Response | None]:
     """向上游探测用户是否已登录。复用当前请求 headers。
     返回 (is_authed, user_guid, error_response)。
     """
@@ -5389,6 +5852,3012 @@ def _playlist_public_fields(record: dict) -> dict:
     }
 
 
+# === 心动模式歌单（华语流行）===
+# 仿每日推荐：网易云热歌榜取候选 -> 按语种过滤「中文」-> 转可播 Track -> 缓存 -> 注入歌单列表。
+# guid 前缀 online:playlist:xd: 与每日推荐(online:playlist:daily:)区分，互不干扰。
+XD_GUID_PREFIX = "online:playlist:xd:"
+XD_PLAYLIST_TAG = "huayu"
+XD_PLAYLIST_SIZE = 40
+XD_NETEASE_TOPLISTS = [3, 0, 1, 2]  # 热歌/新歌/飙升/原创榜，跨榜累计华语候选，去重后挑 40 首
+XD_NAME = "心动·华语流行"
+
+
+def is_xd_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(XD_GUID_PREFIX)
+
+
+# === AI 歌单（按语言 / 心情 / 地区 智能组装）===
+# 每条预设 = 若干「真实榜单」（网易云榜单 id 或酷我 bangId）+ 可选语种过滤。
+# 生成流程与「心动·华语流行」同款：跨榜取候选 → 去重 → 轮转穿插 → 语种筛选 →
+# dailyrec.resolve_source_candidates 解析为可播 online track。
+# ★ 榜单 id 必须真实存在（取自 /api/v1/toplist 与酷我 bangMenu），勿凭空编造。
+AI_CATS = [
+    {"key": "language", "name": "各种语言", "em": "🗣️", "desc": "按语种榜智能筛选组装。"},
+    {"key": "mood", "name": "各种心情", "em": "💗", "desc": "按场景/风格榜组装，适配不同心情。"},
+    {"key": "region", "name": "各个地区", "em": "🌏", "desc": "按国家/地区榜组装，听见世界各地。"},
+]
+
+AI_PRESETS = [
+    # ---------------- 语言 ----------------
+    {"key": "lang_zh", "cat": "language", "name": "华语流行", "em": "🇨🇳", "size": 40, "lang": "中文",
+     "desc": "网易云热歌/新歌/飙升榜中筛出纯中文曲目。",
+     "charts": [{"source": "netease", "id": "3778678"}, {"source": "netease", "id": "3779629"},
+                {"source": "netease", "id": "19723756"}]},
+    {"key": "lang_yue", "cat": "language", "name": "粤语经典", "em": "🫖", "size": 40,
+     "desc": "酷我粤语榜，港味粤语金曲。",
+     "charts": [{"source": "kuwo", "id": "182"}]},
+    {"key": "lang_en", "cat": "language", "name": "欧美英文", "em": "🔤", "size": 40, "lang": "英语",
+     "desc": "欧美热歌/新歌 + Billboard + UK 榜，筛出英文曲目。",
+     "charts": [{"source": "netease", "id": "2809513713"}, {"source": "netease", "id": "2809577409"},
+                {"source": "netease", "id": "60198"}, {"source": "netease", "id": "180106"}]},
+    {"key": "lang_ja", "cat": "language", "name": "日语 ACG", "em": "🌸", "size": 40,
+     "desc": "日语榜 + ACG 榜 + ACG 动画榜，二次元与 J-Pop。",
+     "charts": [{"source": "netease", "id": "5059644681"}, {"source": "netease", "id": "71385702"},
+                {"source": "netease", "id": "3001835560"}]},
+    {"key": "lang_ko", "cat": "language", "name": "韩语潮流", "em": "💜", "size": 40,
+     "desc": "网易云韩语榜 + 酷我韩语榜，K-Pop 热曲。",
+     "charts": [{"source": "netease", "id": "745956260"}, {"source": "kuwo", "id": "184"}]},
+    {"key": "lang_ru", "cat": "language", "name": "俄语风情", "em": "❄️", "size": 40,
+     "desc": "俄语榜 + 俄罗斯 TopHit 流行榜。",
+     "charts": [{"source": "netease", "id": "6732051320"}, {"source": "netease", "id": "6939992364"}]},
+    # ---------------- 心情 ----------------
+    {"key": "mood_heal", "cat": "mood", "name": "治愈·安静", "em": "🌿", "size": 30,
+     "desc": "民谣 + 古典，适合放空与独处。",
+     "charts": [{"source": "netease", "id": "5059661515"}, {"source": "netease", "id": "71384707"}]},
+    {"key": "mood_energy", "cat": "mood", "name": "燃·运动", "em": "🔥", "size": 40,
+     "desc": "电音 + Beatport + 跑步健身榜，节奏拉满。",
+     "charts": [{"source": "netease", "id": "1978921795"}, {"source": "netease", "id": "3812895"},
+                {"source": "kuwo", "id": "297"}]},
+    {"key": "mood_nostalgia", "cat": "mood", "name": "怀旧经典", "em": "📻", "size": 40,
+     "desc": "经典怀旧 + 影视金曲，老歌回味。",
+     "charts": [{"source": "kuwo", "id": "26"}, {"source": "kuwo", "id": "64"}]},
+    {"key": "mood_party", "cat": "mood", "name": "嗨·派对", "em": "🎉", "size": 40,
+     "desc": "慢摇 DJ + 万物 DJ + 极品电音，气氛组必备。",
+     "charts": [{"source": "netease", "id": "6886768100"}, {"source": "kuwo", "id": "176"},
+                {"source": "kuwo", "id": "242"}]},
+    {"key": "mood_guofeng", "cat": "mood", "name": "国风古韵", "em": "🏮", "size": 40,
+     "desc": "国风榜 + 古风音乐榜，东方意境。",
+     "charts": [{"source": "netease", "id": "5059642708"}, {"source": "kuwo", "id": "278"}]},
+    {"key": "mood_rap", "cat": "mood", "name": "说唱街头", "em": "🎤", "size": 40,
+     "desc": "中文说唱 + 酷我说唱榜。",
+     "charts": [{"source": "netease", "id": "991319590"}, {"source": "kuwo", "id": "329"}]},
+    {"key": "mood_drive", "cat": "mood", "name": "车载随行", "em": "🚗", "size": 40,
+     "desc": "酷我车载歌曲榜 + 网络热歌榜，路上不无聊。",
+     "charts": [{"source": "kuwo", "id": "328"}, {"source": "netease", "id": "6723173524"}]},
+    # ---------------- 地区 ----------------
+    {"key": "region_cn", "cat": "region", "name": "中国大陆", "em": "🇨🇳", "size": 40,
+     "desc": "网易云热歌 + 新歌榜，内地流行风向。",
+     "charts": [{"source": "netease", "id": "3778678"}, {"source": "netease", "id": "3779629"}]},
+    {"key": "region_hk", "cat": "region", "name": "香港·粤语", "em": "🇭🇰", "size": 40,
+     "desc": "酷我粤语榜，港乐之声。",
+     "charts": [{"source": "kuwo", "id": "182"}]},
+    {"key": "region_eu", "cat": "region", "name": "欧美", "em": "🌍", "size": 40,
+     "desc": "欧美热歌/新歌 + 欧美 R&B + Billboard。",
+     "charts": [{"source": "netease", "id": "2809513713"}, {"source": "netease", "id": "2809577409"},
+                {"source": "netease", "id": "12225155968"}, {"source": "netease", "id": "60198"}]},
+    {"key": "region_jp", "cat": "region", "name": "日本", "em": "🇯🇵", "size": 40,
+     "desc": "日语榜 + Oricon + ACG 动画榜。",
+     "charts": [{"source": "netease", "id": "5059644681"}, {"source": "netease", "id": "60131"},
+                {"source": "netease", "id": "3001835560"}]},
+    {"key": "region_kr", "cat": "region", "name": "韩国", "em": "🇰🇷", "size": 40,
+     "desc": "网易云韩语榜 + 酷我韩语榜。",
+     "charts": [{"source": "netease", "id": "745956260"}, {"source": "kuwo", "id": "184"}]},
+    {"key": "region_sea", "cat": "region", "name": "东南亚", "em": "🌴", "size": 40,
+     "desc": "越南语榜 + 泰语榜。",
+     "charts": [{"source": "netease", "id": "6732014811"}, {"source": "netease", "id": "7095271308"}]},
+    {"key": "region_ru", "cat": "region", "name": "俄罗斯", "em": "🇷🇺", "size": 40,
+     "desc": "俄语榜 + 俄罗斯 TopHit。",
+     "charts": [{"source": "netease", "id": "6732051320"}, {"source": "netease", "id": "6939992364"}]},
+    {"key": "region_fr", "cat": "region", "name": "法国", "em": "🇫🇷", "size": 25,
+     "desc": "法国 NRJ Vos Hits 周榜。",
+     "charts": [{"source": "netease", "id": "27135204"}]},
+]
+AI_PRESET_INDEX = {p["key"]: p for p in AI_PRESETS}
+
+
+def ai_cache_dir() -> str:
+    d = os.path.join(_HOME, "ai_cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _ai_cache_path(key: str) -> str:
+    safe = "".join(ch for ch in str(key or "") if ch.isalnum() or ch in ("-", "_")) or "x"
+    return os.path.join(ai_cache_dir(), safe + ".json")
+
+
+# v71：生成结果缓存带 TTL（默认 6h）。旧实现无 TTL —— 一旦生成就永久固化，
+# 榜单早已换血，用户「重新生成」拿到的还是同一批歌，表现为「总有几首固定出现」。
+_GEN_CACHE_TTL = float(os.environ.get("FNMUSIC_GEN_CACHE_TTL", str(6 * 3600)))
+
+
+def _ai_load_cache(key: str, ttl: float | None = None) -> list | None:
+    limit = _GEN_CACHE_TTL if ttl is None else float(ttl)
+    path = _ai_cache_path(key)
+    try:
+        if limit > 0 and (time.time() - os.path.getmtime(path)) > limit:
+            return None
+    except Exception:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tracks"), list) and data.get("tracks"):
+            return data["tracks"]
+    except Exception:
+        return None
+    return None
+
+
+def _ai_save_cache(key: str, tracks: list) -> None:
+    path = _ai_cache_path(key)
+    part = f"{path}.{uuid4().hex[:8]}.part"
+    try:
+        with open(part, "w", encoding="utf-8") as f:
+            json.dump({"key": key, "builtAt": int(time.time()), "tracks": tracks},
+                      f, ensure_ascii=False)
+        os.replace(part, path)
+    except Exception as e:
+        logger.warning("ai cache save failed %s: %s", key, e)
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except Exception:
+                pass
+
+
+def _ai_chart_picks(chart: dict) -> list[dict]:
+    """把单个榜单条目（netease 榜单 id / kuwo bangId）转成统一 pick 结构。"""
+    src = str(chart.get("source") or "").strip().lower()
+    cid = str(chart.get("id") or "").strip()
+    if not cid:
+        return []
+    out = []
+    if src == "netease":
+        # 榜单菜单给的是 id，取曲必须用 index ⇒ id -> index
+        info = _netease_toplist_for(cid)
+        idx = info.get("index")
+        rows = _musicbox_toplist_tracks(idx, limit=100) if idx is not None else []
+        # ★ 不少小语种/地区榜（韩语/日语/俄语/越南语/法国…）经 toplist?index= 返回 0 首，
+        #   但同一 id 走 `/api/v1/playlist/{id}` 能拿到 35~100 首（实测 2~23s）。
+        #   ⇒ toplist 取不到时回退，避免这些 AI 歌单「加入后没歌」。
+        if not rows:
+            rows = _musicbox_playlist_tracks_sync(cid, timeout=45)
+        for t in rows:
+            if not isinstance(t, dict):
+                continue
+            sid = str(t.get("song_id") or t.get("id") or "")
+            if not sid:
+                continue
+            try:
+                if t.get("duration_ms") not in (None, ""):
+                    dur_s = float(t.get("duration_ms") or 0) / 1000.0
+                else:
+                    dur_s = float(t.get("duration") or 0)
+            except (TypeError, ValueError):
+                dur_s = 0.0
+            out.append({"source": "netease", "id": sid,
+                        "title": t.get("name") or t.get("song_name") or "",
+                        "artist": t.get("artist") or "",
+                        "album": t.get("album_name") or t.get("album") or "",
+                        "duration_s": dur_s,
+                        "cover_url": t.get("album_pic_url") or t.get("pic") or ""})
+    elif src == "kuwo":
+        for t in _kuwo_bang_tracks(cid, want=60):
+            rid = str(t.get("rid") or "").strip()
+            if not rid:
+                continue
+            out.append({"source": "lx", "id": "lx:kw:%s" % rid,
+                        "title": t.get("title") or "", "artist": t.get("artist") or "",
+                        "album": t.get("album") or "",
+                        "duration_s": t.get("duration_s") or 0,
+                        "cover_url": t.get("cover_url") or ""})
+    return out
+
+
+def _build_ai_tracks(key: str) -> list[dict]:
+    """按预设组装 AI 歌单曲目（跨榜去重 + 轮转穿插 + 可选语种筛选 + 解析为可播曲目）。"""
+    preset = AI_PRESET_INDEX.get(str(key or ""))
+    if not preset:
+        return []
+    cached = _ai_load_cache(key)
+    if cached:
+        return cached
+    size = int(preset.get("size") or 40)
+    charts = list(preset.get("charts") or [])
+    buckets = [[] for _ in charts]
+    # 多榜并发取（回退路径单榜可达 20s+，串行会让「加入」等太久）
+    if charts:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _fetch(i_ch):
+            i, ch = i_ch
+            try:
+                return i, _ai_chart_picks(ch)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ai chart %s/%s failed: %s", key, ch.get("id"), e)
+                return i, []
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(4, len(charts))) as ex:
+                for i, got in ex.map(_fetch, list(enumerate(charts))):
+                    buckets[i] = got
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ai build %s thread pool failed: %s", key, e)
+    lang = preset.get("lang")
+    if lang:
+        buckets = [[p for p in b if dailyrec.infer_language(
+            str(p.get("title") or ""), str(p.get("artist") or "")) == lang] for b in buckets]
+    # 轮转穿插（每轮各榜取一条），保证多榜混合而不是前几首全来自同一榜
+    merged, seen = [], set()
+    depth, max_depth = 0, max((len(b) for b in buckets), default=0)
+    while depth < max_depth and len(merged) < size * 3:
+        for b in buckets:
+            if depth < len(b):
+                p = b[depth]
+                pid = str(p.get("id") or "")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    merged.append(p)
+        depth += 1
+    if not merged:
+        return []
+    tracks = dailyrec.resolve_source_candidates(merged, build_online_track, size)
+    tracks = dailyrec.stamp_playlist_tracks(tracks)
+    if tracks:
+        _ai_save_cache(key, tracks)
+    return tracks
+
+
+# === 歌单生成器（参数组合式：地区 / 心情 / 语言 / 规模）===
+# 与 AI_PRESETS（固定预设）的区别：这里由用户在 UI 上自由组合维度，后端按所选榜单池组装。
+# 榜单 id 全部取自真实榜单（网易云 toplist 63 榜 / 酷我 bangMenu 36 榜），非编造。
+CUSTOM_SOURCE = "custom"
+GEN_SIZES = [20, 30, 40, 60]
+_GEN_DEFAULT_CHARTS = [
+    {"source": "netease", "id": "3778678"},    # 网易云热歌榜
+    {"source": "netease", "id": "3779629"},    # 网易云新歌榜
+    {"source": "netease", "id": "19723756"},   # 网易云飙升榜
+    {"source": "kuwo", "id": "16"},            # 酷我热歌榜（仅在网易不足时补齐）
+]
+
+GEN_DIMS = [
+    {"key": "region", "name": "地区", "em": "🌏", "multi": True,
+     "desc": "选择想听的国家 / 地区（可多选，混合该地榜单）。",
+     "options": [
+         {"key": "cn", "name": "中国大陆", "em": "🇨🇳",
+          "charts": [{"source": "netease", "id": "3778678"}, {"source": "netease", "id": "3779629"},
+                     {"source": "kuwo", "id": "16"}, {"source": "kuwo", "id": "104"}]},
+         {"key": "hk", "name": "香港·粤语", "em": "🇭🇰",
+          "charts": [{"source": "kuwo", "id": "182"}]},
+         {"key": "eu", "name": "欧美", "em": "🌍",
+          "charts": [{"source": "netease", "id": "2809513713"}, {"source": "netease", "id": "2809577409"},
+                     {"source": "netease", "id": "60198"}, {"source": "netease", "id": "12225155968"},
+                     {"source": "kuwo", "id": "22"}]},
+         {"key": "uk", "name": "英国", "em": "🇬🇧",
+          "charts": [{"source": "netease", "id": "180106"}, {"source": "kuwo", "id": "13"}]},
+         {"key": "jp", "name": "日本", "em": "🇯🇵",
+          "charts": [{"source": "netease", "id": "5059644681"}, {"source": "netease", "id": "60131"},
+                     {"source": "kuwo", "id": "183"}, {"source": "kuwo", "id": "15"}]},
+         {"key": "kr", "name": "韩国", "em": "🇰🇷",
+          "charts": [{"source": "netease", "id": "745956260"}, {"source": "kuwo", "id": "184"}]},
+         {"key": "sea", "name": "东南亚", "em": "🌴",
+          "charts": [{"source": "netease", "id": "6732014811"}, {"source": "netease", "id": "7095271308"}]},
+         {"key": "ru", "name": "俄罗斯", "em": "🇷🇺",
+          "charts": [{"source": "netease", "id": "6732051320"}, {"source": "netease", "id": "6939992364"}]},
+         {"key": "fr", "name": "法国", "em": "🇫🇷",
+          "charts": [{"source": "netease", "id": "27135204"}]},
+     ]},
+    {"key": "mood", "name": "心情 / 场景", "em": "💗", "multi": True,
+     "desc": "选择当下的心情或使用场景（可多选，混合风格榜）。",
+     "options": [
+         {"key": "heal", "name": "治愈·安静", "em": "🌿",
+          "charts": [{"source": "netease", "id": "5059661515"}, {"source": "netease", "id": "71384707"}]},
+         {"key": "energy", "name": "燃·运动", "em": "🔥",
+          "charts": [{"source": "netease", "id": "1978921795"}, {"source": "netease", "id": "3812895"},
+                     {"source": "kuwo", "id": "297"}, {"source": "kuwo", "id": "242"}]},
+         {"key": "party", "name": "嗨·派对", "em": "🎉",
+          "charts": [{"source": "netease", "id": "6886768100"}, {"source": "kuwo", "id": "176"},
+                     {"source": "kuwo", "id": "242"}]},
+         {"key": "nostalgia", "name": "怀旧经典", "em": "📻",
+          "charts": [{"source": "kuwo", "id": "26"}, {"source": "kuwo", "id": "64"}]},
+         {"key": "guofeng", "name": "国风古韵", "em": "🏮",
+          "charts": [{"source": "netease", "id": "5059642708"}, {"source": "kuwo", "id": "278"}]},
+         {"key": "rap", "name": "说唱街头", "em": "🎤",
+          "charts": [{"source": "netease", "id": "991319590"}, {"source": "kuwo", "id": "329"}]},
+         {"key": "rock", "name": "摇滚热血", "em": "🎸",
+          "charts": [{"source": "netease", "id": "5059633707"}]},
+         {"key": "acg", "name": "二次元", "em": "🌸",
+          "charts": [{"source": "netease", "id": "71385702"}, {"source": "netease", "id": "3001835560"},
+                     {"source": "netease", "id": "3001795926"}]},
+         {"key": "focus", "name": "专注轻音", "em": "🕯️",
+          "charts": [{"source": "netease", "id": "71384707"}]},
+         {"key": "drive", "name": "车载随行", "em": "🚗",
+          "charts": [{"source": "kuwo", "id": "328"}, {"source": "netease", "id": "6723173524"}]},
+         {"key": "ktv", "name": "欢唱 KTV", "em": "🎙️",
+          "charts": [{"source": "netease", "id": "21845217"}, {"source": "kuwo", "id": "255"}]},
+     ]},
+    {"key": "language", "name": "语言", "em": "🗣️", "multi": False,
+     "desc": "按语种过滤（基于曲目标题/艺人判别；「不限」则不过滤）。",
+     "options": [
+         {"key": "any", "name": "不限", "em": "🌐", "lang": None},
+         {"key": "zh", "name": "中文", "em": "🇨🇳", "lang": "中文"},
+         {"key": "en", "name": "英语", "em": "🔤", "lang": "英语"},
+         {"key": "ja", "name": "日语", "em": "🌸", "lang": "日语"},
+         {"key": "ko", "name": "韩语", "em": "💜", "lang": "韩语"},
+         {"key": "ru", "name": "俄语", "em": "❄️", "lang": "俄语"},
+     ]},
+]
+
+GEN_DIM_INDEX = {d["key"]: d for d in GEN_DIMS}
+_GEN_OPT_INDEX = {(d["key"], o["key"]): o for d in GEN_DIMS for o in d["options"]}
+
+
+def _gen_encode(params: dict) -> str:
+    """把生成参数编成稳定的短 key（持久化进 user_playlists.json 的 source_id）。"""
+    def _join(vals):
+        if isinstance(vals, str):
+            vals = [v.strip() for v in vals.split(",") if v.strip()]
+        vals = [str(v).strip() for v in (vals or []) if str(v).strip()]
+        seen, out = set(), []
+        for v in vals:
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return "-".join(out)
+
+    lang = str(params.get("language") or "any").strip() or "any"
+    try:
+        size = int(params.get("size") or 40)
+    except (TypeError, ValueError):
+        size = 40
+    if size not in GEN_SIZES:
+        size = min(GEN_SIZES, key=lambda s: abs(s - size))
+    return "r:%s;m:%s;l:%s;s:%d" % (_join(params.get("region")), _join(params.get("mood")), lang, size)
+
+
+def _gen_decode(key: str) -> dict:
+    """反解 _gen_encode 的 key（兼容手写/旧格式，未知值直接忽略）。"""
+    out = {"region": [], "mood": [], "language": "any", "size": 40}
+    for seg in str(key or "").split(";"):
+        if ":" not in seg:
+            continue
+        k, _, v = seg.partition(":")
+        v = (v or "").strip()
+        if k == "r":
+            out["region"] = [x for x in v.split("-") if x]
+        elif k == "m":
+            out["mood"] = [x for x in v.split("-") if x]
+        elif k == "l":
+            out["language"] = v or "any"
+        elif k == "s":
+            try:
+                out["size"] = int(v)
+            except (TypeError, ValueError):
+                out["size"] = 40
+    return out
+
+
+def _gen_option(dim: str, key: str) -> dict | None:
+    return _GEN_OPT_INDEX.get((str(dim or ""), str(key or "")))
+
+
+def _gen_sort_charts(charts: list[dict]) -> list[dict]:
+    """榜单排序：★ 网易云优先（用户要求「优先采用网易音源」），同音源内保持配置顺序并去重。"""
+    out, seen = [], set()
+    rank = {"netease": 0, "kuwo": 1}
+    ordered = sorted(charts or [], key=lambda c: rank.get(str(c.get("source") or "").lower(), 9))
+    for ch in ordered:
+        mark = "%s:%s" % (ch.get("source"), ch.get("id"))
+        if mark in seen:
+            continue
+        seen.add(mark)
+        out.append(ch)
+    return out
+
+
+def _gen_chart_groups(params: dict) -> list[dict]:
+    """按所选维度返回 [{dim, opt, charts}]。
+
+    ★ 保留「维度」归属是关键：旧实现把地区池与心情池混成一个扁平列表轮转取曲，
+      条目多的地区热歌榜会把席位吃光，心情参数形同虚设 —— 这正是「换任何参数都是同一批歌」的根因。
+    一个维度都没选时回退默认热门榜（网易热歌 / 新歌优先）。
+    """
+    groups = []
+    for dim in ("region", "mood"):
+        for k in (params.get(dim) or []):
+            opt = _gen_option(dim, k)
+            if not opt:
+                continue
+            groups.append({"dim": dim, "opt": k,
+                           "charts": _gen_sort_charts(opt.get("charts") or [])})
+    if not groups:
+        groups.append({"dim": "region", "opt": "", "charts": _gen_sort_charts(_GEN_DEFAULT_CHARTS)})
+    return groups
+
+
+def _gen_charts(params: dict) -> list[dict]:
+    """扁平化后的榜单列表（供预览显示「取自 N 个榜单」）。"""
+    out, seen = [], set()
+    for g in _gen_chart_groups(params):
+        for ch in g["charts"]:
+            mark = "%s:%s" % (ch.get("source"), ch.get("id"))
+            if mark not in seen:
+                seen.add(mark)
+                out.append(ch)
+    return out
+
+
+def _gen_name(params: dict) -> str:
+    parts = []
+    for dim in ("region", "mood"):
+        for k in (params.get(dim) or []):
+            opt = _gen_option(dim, k)
+            if opt:
+                parts.append(opt["name"])
+    lang_opt = _gen_option("language", params.get("language") or "any")
+    if lang_opt and lang_opt.get("lang"):
+        parts.append(lang_opt["name"] + "歌")
+    try:
+        size = int(params.get("size") or 40)
+    except (TypeError, ValueError):
+        size = 40
+    head = "·".join(parts) if parts else "热门混合"
+    return "%s %d首" % (head, size)
+
+
+# === v71：生成规则重写 ===
+# 旧规则 = 所有入选榜单「按 depth 轮转取榜首」：条目多的热歌榜会一路吃到满，
+# 条目少的心情榜几轮就抽干 ⇒ 换任何心情/语言，歌单里 45%~85% 都是同一批华语热歌（实测 9 首 8/8 常驻）。
+# 新规则四要点：
+#   (1) 维度配额：地区 / 心情 各占一半席位，维度内按选项均分、选项内按榜单均分 —— 杜绝大榜霸屏；
+#   (2) 榜内加权确定性抽样：seed 由参数 key 决定，排名靠前权重更高但不再「必然取榜首」；
+#       ⇒ 同一参数结果稳定可复现，不同参数取样窗口不同，不再恒定命中榜首那几首；
+#   (3) 网易优先：先只取网易榜单，不够再用酷我补齐（用户要求 + 顺带省掉酷我请求）；
+#   (4) 跨源去重：按「标题+艺人」规范化去重，避免网易/酷我热歌榜把同一首歌灌两次。
+
+
+def _gen_seed(key: str) -> int:
+    """由参数 key 导出稳定随机种子（同一参数 → 同一结果，不同参数 → 不同取样）。"""
+    import zlib
+    return zlib.crc32(str(key).encode("utf-8")) & 0xFFFFFFFF
+
+
+def _norm_ta(title: str, artist: str) -> str:
+    """标题+艺人 规范化（去空白/标点/括号/大小写），用于跨音源去重。"""
+    import re as _re
+    pat = r"[\s（）()\[\]【】·・,，、\-_—~～!！?？'\"“”`]+"
+    t = _re.sub(pat, "", str(title or "").lower())
+    a = _re.sub(pat, "", str(artist or "").lower())
+    return t + "|" + a
+
+
+def _gen_weighted_order(items: list, seed: int, power: float = 0.6) -> list:
+    """榜内加权随机排序（Efraimidis-Spirakis）：越靠前越容易入选，但不保证。
+
+    power 越大 → 越偏向榜单头部；0.6 实测能在「保持热度倾向」与「参数间差异化」之间取平衡。
+    """
+    import random
+    r = random.Random(seed)
+    scored = []
+    for i, it in enumerate(items):
+        w = 1.0 / ((i + 1) ** power)
+        u = r.random()
+        if u <= 0.0:
+            u = 1e-9
+        scored.append((u ** (1.0 / w), i, it))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [it for _, _, it in scored]
+
+
+def _gen_quotas(groups: list[dict], size: int) -> list[tuple]:
+    """给每个 (group, chart) 分配席位：维度均分 → 选项均分 → 榜单均分。"""
+    dims: dict = {}
+    for g in groups:
+        dims.setdefault(g["dim"], []).append(g)
+    plan = []
+    for _dim, gs in dims.items():
+        dim_quota = max(1, size // len(dims))
+        per_opt = max(1, dim_quota // max(1, len(gs)))
+        for g in gs:
+            charts = g["charts"] or [{}]
+            per_chart = max(1, per_opt // max(1, len(charts)))
+            for ch in charts:
+                plan.append((g, ch, per_chart))
+    return plan
+
+
+def _gen_fetch(charts: list[dict], tag: str) -> dict:
+    """并发取榜，返回 {mark: [picks]}。"""
+    out: dict = {}
+    if not charts:
+        return out
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch(ch):
+        try:
+            return ch, _ai_chart_picks(ch)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("gen chart %s/%s failed: %s", tag, ch.get("id"), e)
+            return ch, []
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, len(charts))) as ex:
+            for ch, got in ex.map(_fetch, list(charts)):
+                out["%s:%s" % (ch.get("source"), ch.get("id"))] = list(got or [])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("gen build %s thread pool failed: %s", tag, e)
+    return out
+
+
+def _gen_take(pick: dict, used_id: set, used_ta: set) -> bool:
+    """去重后收录（id 去重 + 标题艺人跨源去重）。"""
+    pid = str(pick.get("id") or "")
+    ta = _norm_ta(pick.get("title"), pick.get("artist"))
+    dup = False
+    if pid and pid in used_id:
+        dup = True
+    if ta != "|" and ta in used_ta:
+        dup = True
+    if dup:
+        return False
+    if pid:
+        used_id.add(pid)
+    if ta != "|":
+        used_ta.add(ta)
+    return True
+
+
+def _gen_allocate(groups: list[dict], picks: dict, size: int, seed: int,
+                  lang: str | None, used_id: set, used_ta: set,
+                  only: set | None = None) -> list:
+    """按维度配额从已取到的榜单池里挑曲目（配额轮 + 补足轮）。"""
+    if size <= 0:
+        return []
+    usable, quotas, ordered = [], [], []
+    for g, ch, q in _gen_quotas(groups, size):
+        mark = "%s:%s" % (ch.get("source"), ch.get("id"))
+        if only is not None and mark not in only:
+            continue
+        rows = list(picks.get(mark) or [])
+        if lang:
+            rows = [p for p in rows if dailyrec.infer_language(
+                str(p.get("title") or ""), str(p.get("artist") or "")) == lang]
+        if not rows:
+            continue
+        usable.append((g, ch, rows))
+        quotas.append(q)
+    if not usable:
+        return []
+    for i, (_g, _ch, rows) in enumerate(usable):
+        ordered.append(_gen_weighted_order(rows, seed + i * 977))
+
+    selected: list = []
+    cursors = [0] * len(usable)
+    left = list(quotas)
+
+    # ---- 配额轮：每个榜单最多贡献自己的席位 ----
+    progress = True
+    while len(selected) < size and progress:
+        progress = False
+        for i in range(len(usable)):
+            if len(selected) >= size:
+                break
+            if left[i] <= 0:
+                continue
+            ol = ordered[i]
+            while cursors[i] < len(ol) and left[i] > 0 and len(selected) < size:
+                p = ol[cursors[i]]
+                cursors[i] += 1
+                if _gen_take(p, used_id, used_ta):
+                    selected.append(p)
+                    left[i] -= 1
+                    progress = True
+                    break
+
+    # ---- 补足轮：配额没吃满 / 池子不够时，按「网易优先」继续取 ----
+    if len(selected) < size:
+        rank = {"netease": 0, "kuwo": 1}
+        order = sorted(range(len(usable)),
+                       key=lambda i: (rank.get(str(usable[i][1].get("source") or "").lower(), 9), i))
+        for i in order:
+            ol = ordered[i]
+            while cursors[i] < len(ol) and len(selected) < size:
+                p = ol[cursors[i]]
+                cursors[i] += 1
+                if _gen_take(p, used_id, used_ta):
+                    selected.append(p)
+    return selected
+
+
+def _build_custom_tracks(key: str) -> list[dict]:
+    """按参数 key 组装自定义歌单曲目。
+
+    流程：维度分组 → 优先取网易榜 → 配额+加权抽样 → 不足再用酷我补 → 解析为可播曲目 → 缓存(6h)。
+    """
+    key = str(key or "").strip()
+    if not key:
+        return []
+    cached = _ai_load_cache("gen_" + key)
+    if cached:
+        return cached
+    params = _gen_decode(key)
+    size = int(params.get("size") or 40)
+    groups = _gen_chart_groups(params)
+    lang = (_gen_option("language", params.get("language") or "any") or {}).get("lang")
+    seed = _gen_seed(key)
+
+    # 阶段 1：只取网易榜单（音源优先级；顺带省掉酷我的请求耗时）
+    ne_charts, kw_charts = [], []
+    for g in groups:
+        for ch in g["charts"]:
+            if str(ch.get("source") or "").lower() == "netease":
+                ne_charts.append(ch)
+            else:
+                kw_charts.append(ch)
+    picks = _gen_fetch(ne_charts, key)
+    used_id: set = set()
+    used_ta: set = set()
+    selected = _gen_allocate(groups, picks, size, seed, lang, used_id, used_ta)
+    ne_yield = len(selected)
+
+    # 阶段 2：网易不足，再取酷我补齐
+    if len(selected) < size and kw_charts:
+        picks.update(_gen_fetch(kw_charts, key))
+        kw_only = {"%s:%s" % (c.get("source"), c.get("id")) for c in kw_charts}
+        selected += _gen_allocate(groups, picks, size - len(selected), seed, lang,
+                                  used_id, used_ta, only=kw_only)
+    # 兜底：所选榜单整体取不到曲（部分小语种/地区榜当前无数据，实测「法国」返回 0 首）
+    # → 回退默认热门榜补齐，避免用户点了生成却得到一张空歌单。
+    # ★ 只在「榜单本身没数据」时兜底，不用于补偿语种过滤造成的少量（那是对用户选择的忠实执行）。
+    pool_total = sum(len(v) for v in picks.values())
+    if pool_total < max(6, size // 4):
+        fb_charts = _gen_sort_charts(_GEN_DEFAULT_CHARTS)
+        picks.update(_gen_fetch(fb_charts, key + ":fb"))
+        fb_only = {"%s:%s" % (c.get("source"), c.get("id")) for c in fb_charts}
+        fb_groups = [{"dim": "region", "opt": "", "charts": fb_charts}]
+        selected += _gen_allocate(fb_groups, picks, size - len(selected), seed + 7919,
+                                  lang, used_id, used_ta, only=fb_only)
+    if not selected:
+        return []
+    tracks = dailyrec.resolve_source_candidates(selected, build_online_track, size)
+    tracks = dailyrec.stamp_playlist_tracks(tracks)
+    if tracks:
+        _ai_save_cache("gen_" + key, tracks)
+    logger.info("gen %s built: %d tracks (netease-only %d, charts %d)",
+                key, len(tracks), ne_yield, len(picks))
+    return tracks
+
+
+def _admin_playlists_dims() -> dict:
+    return {"code": 0, "dims": GEN_DIMS, "sizes": GEN_SIZES, "default_size": 40}
+
+
+def _admin_playlists_generate(body: dict) -> dict:
+    """按参数生成歌单，返回预览（名称 / 曲目数 / 样例），供 UI 确认后加入。"""
+    params = {
+        "region": body.get("region") or [],
+        "mood": body.get("mood") or [],
+        "language": str(body.get("language") or "any").strip() or "any",
+        "size": body.get("size") or 40,
+    }
+    key = _gen_encode(params)
+    name = _gen_name(params)
+    try:
+        tracks = _build_custom_tracks(key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("generate %s failed: %s", key, e)
+        return {"code": 1, "msg": "生成失败：%s" % e, "key": key, "name": name}
+    sample = [{"title": t.get("title") or "", "artist": t.get("artist") or "",
+               "guid": t.get("guid") or ""} for t in tracks[:5]]
+    want = int(params.get("size") or 40)
+    return {"code": 0, "key": key, "name": name, "track_count": len(tracks),
+            "charts": len(_gen_charts(params)), "sample": sample,
+            "params": _gen_decode(key), "requested_size": want,
+            "low_yield": bool(len(tracks) < want), "netease_first": True}
+
+
+# === 用户管理歌单（当前歌单）===
+# 用户在管理台从各音源「加入」的歌单，持久化在 user_playlists.json；guid 前缀 online:playlist:user:
+# 注入歌单列表/paginate 取曲均复用每日推荐/心动的同一套解析路径（dailyrec.resolve_source_candidates + build_online_track）。
+USER_GUID_PREFIX = "online:playlist:user:"
+USER_PLAYLIST_SIZE = 500  # 单用户歌单曲目上限（网易云榜单普遍 <=200，留足余量）
+
+
+def is_user_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(USER_GUID_PREFIX)
+
+
+def _user_playlist_id_from_guid(guid: str) -> str:
+    return str(guid or "")[len(USER_GUID_PREFIX):]
+
+
+def user_playlists_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_playlists.json")
+
+
+def _load_user_playlists() -> list[dict]:
+    try:
+        with open(user_playlists_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("playlists"), list):
+            arr = data["playlists"]
+        elif isinstance(data, list):
+            arr = data
+        else:
+            arr = []
+        out = []
+        for it in arr:
+            if not isinstance(it, dict) or not it.get("id"):
+                continue
+            out.append({
+                "id": str(it.get("id")),
+                "source": str(it.get("source") or "netease"),
+                "source_id": str(it.get("source_id") or ""),
+                "name": str(it.get("name") or "未命名歌单"),
+                "enabled": bool(it.get("enabled", True)),
+                "order": int(it.get("order") or 0),
+                "track_count": int(it.get("track_count") or 0),
+            })
+        out.sort(key=lambda x: x["order"])
+        return out
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        logger.warning("load user_playlists failed: %s", e)
+        return []
+
+
+def _load_pl_file() -> dict:
+    """读取 user_playlists.json 整体（含 layout），失败返回 {}。"""
+    try:
+        with open(user_playlists_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_layout() -> list:
+    """当前歌单的整体展示顺序（含内置 id：daily / xd）。未设置时返回 []。"""
+    lay = _load_pl_file().get("layout")
+    return [str(x) for x in lay] if isinstance(lay, list) else []
+
+
+def _save_layout(ids: list) -> None:
+    """持久化当前歌单整体顺序（含内置 id）。"""
+    d = _load_pl_file()
+    d["version"] = 1
+    d["layout"] = [str(x) for x in ids]
+    if not isinstance(d.get("playlists"), list):
+        d["playlists"] = []
+    p = user_playlists_path()
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _save_user_playlists(arr: list[dict]) -> None:
+    for i, it in enumerate(arr):
+        it["order"] = i
+    # 保留 layout（整体顺序），避免被覆盖丢失
+    payload = _load_pl_file()
+    payload["version"] = 1
+    payload["playlists"] = arr
+    p = user_playlists_path()
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _user_public_fields(rec: dict, track_count: int) -> dict:
+    # rec 既可能是持久化 meta（含 id），也可能是 bundle 内的 playlist 记录（含 guid）。
+    # 缺 id 时必须回退到自带 guid，否则会返回被截断的 "online:playlist:user:"。
+    guid = str(rec.get("guid") or "") or (USER_GUID_PREFIX + str(rec.get("id") or ""))
+    meta_cover = str(rec.get("cover") or "")
+    cover = meta_cover or str(rec.get("coverId") or "")
+    if not cover and str(rec.get("source") or "").strip().lower() == "xmly" and rec.get("source_id"):
+        # v77：小说歌单（喜马拉雅）用专辑海报，而不是拿不到图的 user guid（会掉占位图）。
+        # coverId 必须是 /static/cover 认得的**歌单 guid**（见 _xmly_album_to_playlist_record 说明）。
+        cover = XMLY_PLAYLIST_PREFIX + str(rec.get("source_id"))
+    if meta_cover and str(cover).startswith(XMLY_PLAYLIST_PREFIX):
+        try:
+            _warm_xmly_poster(cover, meta_cover)
+        except Exception:  # noqa: BLE001
+            pass
+    cover = cover or guid
+    return {
+        "guid": guid,
+        "name": rec.get("name") or "未命名歌单",
+        "coverId": cover,
+        "createdAt": int(rec.get("createdAt") or time.time()),
+        "updatedAt": int(rec.get("updatedAt") or time.time()),
+        "trackCount": int(track_count or 0),
+        "isDaily": False,
+    }
+
+
+def _user_playlist_record(tracks: list, cover: str, name: str, guid: str) -> dict:
+    return {
+        "guid": guid,
+        "name": name or "未命名歌单",
+        "coverId": cover or guid,
+        "createdAt": int(time.time()),
+        "updatedAt": int(time.time()),
+        "trackCount": len(tracks or []),
+        "isDaily": False,
+    }
+
+
+async def _fetch_musicbox_playlist_tracks(client, playlist_id: str) -> list[dict]:
+    """经 musicbox `/api/v1/playlist/{id}` 取网易云**任意**歌单曲目（榜单外的歌单用这条）。
+
+    ★★ 结论修正（v68）：该端点**是可用的**，早期判定「恒 INVALID TOKEN」是**瞬时令牌失效**造成的误判
+      （当时 token 过期；重新登录后实测 `/api/v1/playlist/3778678` → 200 首、
+      `/api/v1/playlist/6792103822` → 143 首）。偶发 `code 99999 INVALID TOKEN` 仍可能出现，
+      属令牌瞬时失效，不是接口不可用。
+    ★ **很慢**：musicbox 内部走 CLI 调网易云，实测 **15~60s**，因此 timeout 必须给足（默认 60s），
+      且只在「榜单 id 取不到」时才走这条；榜单请优先用 `_musicbox_toplist_tracks(index)`（快，25 首）。
+    返回 `data` 为曲目列表：song_id / song_name / artist / album_name / album_id / mp3_url。
+    """
+    try:
+        resp = await client.get(f"/api/v1/playlist/{playlist_id}", timeout=60.0)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        arr = data.get("data") if isinstance(data, dict) else data
+        return arr if isinstance(arr, list) else []
+    except Exception as e:
+        logger.warning("musicbox playlist %s fetch failed: %s", playlist_id, e)
+        return []
+
+
+def _musicbox_playlist_tracks_sync(playlist_id: str, timeout: float = 60.0) -> list:
+    """同步版 `_fetch_musicbox_playlist_tracks`（供管理台这类同步上下文使用）。
+
+    同 ★★ 结论：端点可用但很慢（15~60s），调用处应考虑缓存，别放在高频路径上。
+    """
+    try:
+        status, payload, _ = _mb_http("GET", "/api/v1/playlist/%s" % str(playlist_id), timeout=timeout)
+        if status != 200 or not isinstance(payload, dict):
+            return []
+        arr = payload.get("data")
+        return arr if isinstance(arr, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# === v72：用户歌单 bundle 缓存层 ===
+# 背景（真实 token 直连 takeover socket 实测）：
+#   playlist/batch-detail（3 个歌单）4.4s / 30.6s；153 首歌单 detail 4.1s、track-list 27.1s。
+# 根因：构建 bundle 的 `_build_user_bundle()` 每次请求都重新从 musicbox 取曲，
+#   而**非榜单**歌单只能走 `/api/v1/playlist/{id}`（musicbox 内部走 CLI，实测 15~60s），
+#   且 v72 之前**没有任何缓存**；batch-detail 还对每个歌单**串行**各拉一次，N 个歌单就是 N 倍耗时。
+# 方案（四件套）：
+#   (1) 内存缓存 10min —— 命中即 0ms；
+#   (2) 磁盘缓存 2h —— 进程重启后不必再等 15~60s；
+#   (3) stale-while-revalidate —— 磁盘过期也**先返回旧值**，后台悄悄重建，用户永远不等待；
+#   (4) 单飞锁 —— 同一歌单并发只打一次 musicbox。
+_USER_BUNDLE_MEM: dict = {}
+_USER_BUNDLE_MEM_TTL = float(os.environ.get("FNMUSIC_BUNDLE_MEM_TTL", "600"))
+_USER_BUNDLE_DISK_TTL = float(os.environ.get("FNMUSIC_BUNDLE_DISK_TTL", str(2 * 3600)))
+_USER_BUNDLE_LOCKS: dict = {}
+_USER_BUNDLE_REFRESHING: set = set()
+
+
+def _user_bundle_cache_dir() -> str:
+    d = os.path.join(_HOME, "bundle_cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _user_bundle_cache_path(user_id: str) -> str:
+    safe = "".join(ch for ch in str(user_id or "") if ch.isalnum() or ch in ("-", "_")) or "x"
+    return os.path.join(_user_bundle_cache_dir(), safe + ".json")
+
+
+def _user_bundle_disk_load(user_id: str) -> tuple:
+    """读磁盘缓存，返回 (bundle|None, age_seconds)。"""
+    p = _user_bundle_cache_path(user_id)
+    try:
+        age = time.time() - os.path.getmtime(p)
+    except Exception:
+        return None, -1.0
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tracks"), list):
+            return data, age
+    except Exception as e:
+        logger.warning("user bundle cache read failed %s: %s", user_id, e)
+    return None, age
+
+
+def _user_bundle_disk_save(user_id: str, bundle: dict) -> None:
+    p = _user_bundle_cache_path(user_id)
+    part = "%s.%s.part" % (p, uuid4().hex[:8])
+    try:
+        with open(part, "w", encoding="utf-8") as f:
+            json.dump({"builtAt": int(time.time()), **bundle}, f, ensure_ascii=False)
+        os.replace(part, p)
+    except Exception as e:
+        logger.warning("user bundle cache save failed %s: %s", user_id, e)
+        try:
+            if os.path.exists(part):
+                os.remove(part)
+        except Exception:
+            pass
+
+
+def _invalidate_user_bundle(user_id: str) -> None:
+    """v72b：丢弃某个用户歌单的 bundle 缓存（内存 + 磁盘）。
+
+    删除歌单、或源站内容已变需要立刻重拉时调用。管理端在单独线程里跑，
+    这里只做 dict/文件操作，线程安全。
+    """
+    key = str(user_id or "")
+    try:
+        _USER_BUNDLE_MEM.pop(key, None)
+        _USER_BUNDLE_LOCKS.pop(key, None)
+        _USER_BUNDLE_REFRESHING.discard(key)
+    except Exception:
+        pass
+    try:
+        p = _user_bundle_cache_path(key)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception as e:
+        logger.warning("user bundle cache invalidate failed %s: %s", key, e)
+
+
+def _peek_user_bundle(user_id: str) -> dict | None:
+    """只看缓存、**绝不**触发慢构建（供 batch-detail 秒开；未命中返回 None）。"""
+    key = str(user_id or "")
+    now = time.time()
+    hit = _USER_BUNDLE_MEM.get(key)
+    if hit and hit[0] > now and (hit[1].get("tracks") or []):
+        return hit[1]
+    disk, _age = _user_bundle_disk_load(key)
+    if disk and (disk.get("tracks") or []):
+        _USER_BUNDLE_MEM[key] = (now + _USER_BUNDLE_MEM_TTL, disk)
+        return disk
+    return None
+
+
+async def _refresh_user_bundle_bg(app, user_id: str) -> None:
+    try:
+        bundle = await _refresh_user_bundle(app, user_id)
+        # v72c：后台构建完顺手把真实曲目数落盘。
+        # 否则「加入时还没算出曲目数」的非榜单歌单（track_count=0）在 App 列表里
+        # 会一直显示「0 首」，看起来像空歌单 —— batch-detail 现在正是读这个占位值。
+        try:
+            n = len(bundle.get("tracks") or [])
+            if n > 0:
+                arr = _load_user_playlists()
+                changed = False
+                for it in arr:
+                    if str(it.get("id")) == str(user_id) and int(it.get("track_count") or 0) != n:
+                        it["track_count"] = n
+                        changed = True
+                if changed:
+                    _save_user_playlists(arr)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("user bundle track_count backfill %s failed: %s", user_id, e)
+    except Exception as e:
+        logger.warning("user bundle bg refresh %s failed: %s", user_id, e)
+    finally:
+        _USER_BUNDLE_REFRESHING.discard(str(user_id))
+
+
+async def _load_user_bundle(request: Request, user_id: str) -> dict:
+    """带缓存的用户歌单 bundle（**调用方入口**）。
+
+    命中顺序：内存(10min) → 磁盘(2h，过期则先返回旧值并后台重建) → 构建（单飞锁）。
+    """
+    key = str(user_id or "")
+    now = time.time()
+    hit = _USER_BUNDLE_MEM.get(key)
+    if hit and hit[0] > now and (hit[1].get("tracks") or []):
+        return hit[1]
+    disk, age = _user_bundle_disk_load(key)
+    if disk and (disk.get("tracks") or []):
+        _USER_BUNDLE_MEM[key] = (now + _USER_BUNDLE_MEM_TTL, disk)
+        if 0 <= age <= _USER_BUNDLE_DISK_TTL:
+            return disk
+        # 已过期：先把旧值给用户，后台悄悄重建（stale-while-revalidate）
+        if key not in _USER_BUNDLE_REFRESHING:
+            _USER_BUNDLE_REFRESHING.add(key)
+            _spawn_bg_task(_refresh_user_bundle_bg(request.app, key))
+        return disk
+    return await _refresh_user_bundle(request.app, key)
+
+
+async def _refresh_user_bundle(app, user_id: str) -> dict:
+    """真正构建（单飞锁保护），并回填内存 + 磁盘。"""
+    key = str(user_id or "")
+    lock = _USER_BUNDLE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_BUNDLE_LOCKS[key] = lock
+    async with lock:
+        now = time.time()
+        hit = _USER_BUNDLE_MEM.get(key)
+        if hit and hit[0] > now and (hit[1].get("tracks") or []):
+            return hit[1]
+        bundle = await _build_user_bundle(app, key)
+        if bundle.get("tracks"):
+            _USER_BUNDLE_MEM[key] = (time.time() + _USER_BUNDLE_MEM_TTL, bundle)
+            _user_bundle_disk_save(key, bundle)
+        return bundle
+
+
+async def _build_user_bundle(app, user_id: str) -> dict:
+    """构建用户歌单 bundle：从源取曲目 -> 解析为可播 online track（复用心动同款 resolve 路径）。
+    ★ 慢（非榜单歌单 15~60s）—— 只允许经 `_load_user_bundle` / `_refresh_user_bundle` 调用。
+    """
+    pls = _load_user_playlists()
+    meta = next((p for p in pls if p["id"] == user_id), None)
+    if not meta:
+        return {"guid": USER_GUID_PREFIX + user_id, "playlist": _user_playlist_record([], "", "未命名歌单", USER_GUID_PREFIX + user_id), "tracks": []}
+    guid = USER_GUID_PREFIX + user_id
+    tracks: list[dict] = []
+    cover_override = ""
+    try:
+        if meta["source"] == "netease" and meta["source_id"]:
+            # 榜单 id → 走快的 `/api/v1/toplist?index=N`（25 首）；
+            # 搜出来的非榜单歌单 → 回退 `/api/v1/playlist/{id}`（慢，最多约 200 首）。
+            info = _netease_toplist_for(meta["source_id"])
+            idx = info.get("index")
+            raw = _musicbox_toplist_tracks(idx, limit=100) if idx is not None else []
+            if not raw:
+                raw = await _fetch_musicbox_playlist_tracks(
+                    get_musicbox_client(app), meta["source_id"])
+            picks = []
+            for t in raw:
+                if not isinstance(t, dict):
+                    continue
+                sid = str(t.get("song_id") or t.get("id") or "")
+                if not sid:
+                    continue
+                # ★ 两套字段名：榜单 = duration_ms(毫秒)；任意歌单 = duration(秒)。
+                #   早期只读 duration_ms ⇒ 搜索出来的歌单时长恒 0，必须两者都认。
+                try:
+                    if t.get("duration_ms") not in (None, ""):
+                        dur_s = float(t.get("duration_ms") or 0) / 1000.0
+                    else:
+                        dur_s = float(t.get("duration") or 0)
+                except (TypeError, ValueError):
+                    dur_s = 0.0
+                picks.append({
+                    "source": "netease",
+                    "id": sid,
+                    "title": t.get("name") or t.get("song_name") or t.get("title") or "",
+                    "artist": t.get("artist") or "",
+                    "album": t.get("album_name") or t.get("album") or "",
+                    "duration_s": dur_s,
+                    "cover_url": t.get("album_pic_url") or t.get("pic") or "",
+                })
+            if picks:
+                tracks = dailyrec.resolve_source_candidates(picks, build_online_track, USER_PLAYLIST_SIZE)
+                tracks = dailyrec.stamp_playlist_tracks(tracks)
+            else:
+                logger.warning("user playlist %s netease 榜单 id=%s 未取到曲目（index=%s）",
+                               user_id, meta["source_id"], idx)
+        elif meta["source"] == "kuwo" and meta["source_id"]:
+            # 酷我：榜单走 bangMenu 选曲；搜出来的用户歌单走 playListInfo（★ 大写 L）
+            # 两者都经洛雪（KuwoMusicClient）取流 —— id 形如 lx:kw:<rid>（实测可播：lossless flac）
+            raw = (_kuwo_bang_tracks(meta["source_id"], want=60) if _kuwo_is_bang(meta["source_id"])
+                   else _kuwo_playlist_tracks(meta["source_id"], want=60))
+            picks = []
+            for t in raw:
+                rid = str(t.get("rid") or "").strip()
+                if not rid:
+                    continue
+                picks.append({
+                    "source": "lx",
+                    "id": "lx:kw:%s" % rid,
+                    "title": t.get("title") or "",
+                    "artist": t.get("artist") or "",
+                    "album": t.get("album") or "",
+                    "duration_s": t.get("duration_s") or 0,
+                    "cover_url": t.get("cover_url") or "",
+                })
+            if picks:
+                tracks = dailyrec.resolve_source_candidates(picks, build_online_track, USER_PLAYLIST_SIZE)
+                tracks = dailyrec.stamp_playlist_tracks(tracks)
+        elif meta["source"] == "ai" and meta["source_id"]:
+            # AI 歌单：按预设（语言/心情/地区）从真实榜单智能组装，已含 stamp
+            tracks = _build_ai_tracks(meta["source_id"])
+        elif meta["source"] == CUSTOM_SOURCE and meta["source_id"]:
+            # 生成器歌单：按参数（地区/心情/语言/规模）组装，已含 stamp
+            tracks = _build_custom_tracks(meta["source_id"])
+        elif meta["source"] == "xmly" and meta["source_id"]:
+            # v77 喜马拉雅：一部小说 = 一个专辑 = 一个歌单。
+            # 不走 resolve_source_candidates —— 那个是给「搜索候选」做可播性筛选的，
+            # 喜马拉雅的每一集本来就能播（取流地址由 xmly-service 现解），再筛一遍纯属浪费。
+            tracks = await _xmly_playlist_tracks(meta["source_id"])
+            if tracks:
+                try:
+                    tracks = dailyrec.stamp_playlist_tracks(tracks)
+                except Exception:  # noqa: BLE001
+                    pass
+                # v77：小说歌单的海报用**专辑封面**（= 搜索结果里那张），而不是第一集的封面。
+                #   cover_override 必须是 /static/cover 认得的歌单 guid。
+                cover_override = XMLY_PLAYLIST_PREFIX + str(meta["source_id"])
+                _xm_cv = str(meta.get("cover") or "") or str(tracks[0].get("cover_url") or "")
+                try:
+                    _warm_xmly_poster(cover_override, _xm_cv)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            logger.info("user playlist %s source=%s 暂不支持取曲", user_id, meta["source"])
+    except Exception as e:
+        logger.warning("user playlist %s build failed: %s", user_id, e)
+    cover = (cover_override if cover_override
+             else (tracks[0].get("coverId") or tracks[0].get("guid") or guid if tracks else guid))
+    return {"guid": guid, "playlist": _user_playlist_record(tracks, cover, meta["name"], guid), "tracks": tracks}
+
+
+def xd_cache_dir() -> str:
+    d = os.path.join(_HOME, "xd_cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def xd_cache_path() -> str:
+    return os.path.join(xd_cache_dir(), f"{XD_PLAYLIST_TAG}.json")
+
+
+def load_xd_cache() -> dict | None:
+    path = xd_cache_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("tracks"), list):
+            return data
+    except Exception as e:
+        logger.warning("failed to load xd cache: %s", e)
+    return None
+
+
+def save_xd_cache(payload: dict) -> None:
+    path = xd_cache_path()
+    part = f"{path}.{uuid4().hex[:8]}.part"
+    try:
+        with open(part, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(part, path)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("failed to save xd cache: %s", e)
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except Exception:
+                pass
+
+
+def xd_playlist_record(tracks: list[dict], cover: str | None = None) -> dict:
+    ts = int(time.time())
+    cover_id = cover or (XD_GUID_PREFIX + XD_PLAYLIST_TAG)
+    return {
+        "guid": XD_GUID_PREFIX + XD_PLAYLIST_TAG,
+        "name": XD_NAME,
+        "coverId": cover_id,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": len(tracks),
+        "isDaily": False,
+    }
+
+
+def empty_xd_bundle() -> dict:
+    rec = xd_playlist_record([])
+    return {"guid": rec["guid"], "playlist": rec, "tracks": [], "builtAt": int(time.time())}
+
+
+def _xd_public_fields(record: dict) -> dict:
+    _warm_daily_poster(record.get("coverId") or record.get("guid"))
+    return {
+        "guid": record.get("guid"),
+        "name": record.get("name") or XD_NAME,
+        "coverId": record.get("coverId") or record.get("guid"),
+        "createdAt": int(record.get("createdAt") or time.time()),
+        "updatedAt": int(record.get("updatedAt") or time.time()),
+        "trackCount": int(record.get("trackCount") or 0),
+        "isDaily": False,
+    }
+
+
+async def get_or_build_xd(request: Request) -> dict:
+    cached = load_xd_cache()
+    if cached and cached.get("tracks"):
+        return cached
+    if not (CONF["netease_enabled"] and CONF["xd_enabled"]):
+        return empty_xd_bundle()
+    musicbox_client = get_musicbox_client(request.app)
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+    for idx in XD_NETEASE_TOPLISTS:
+        try:
+            items = await dailyrec.fetch_musicbox_recommend(
+                musicbox_client, "/api/v1/toplist", {"index": idx, "limit": 80}
+            )
+        except Exception as e:
+            logger.debug("xd toplist %s failed: %s", idx, e)
+            items = []
+        for c in items:
+            cid = str(c.get("id") or "")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                candidates.append(c)
+    zh = [
+        c for c in candidates
+        if dailyrec.infer_language(str(c.get("title") or ""), str(c.get("artist") or "")) == "中文"
+    ]
+    # 纯华语优先：凑满 40 首；华语不足则全部用华语（绝不掺非华语，保证「华语流行」纯度）
+    picks = zh[:XD_PLAYLIST_SIZE] if len(zh) >= XD_PLAYLIST_SIZE else zh
+    tracks = dailyrec.resolve_source_candidates(picks, build_online_track, XD_PLAYLIST_SIZE)
+    tracks = dailyrec.stamp_playlist_tracks(tracks)
+    cover = ""
+    if tracks:
+        cover = tracks[0].get("coverId") or tracks[0].get("guid") or ""
+    playlist = xd_playlist_record(tracks, cover)
+    payload = {
+        "guid": playlist["guid"],
+        "playlist": playlist,
+        "tracks": tracks,
+        "builtAt": int(time.time()),
+    }
+    if tracks:
+        save_xd_cache(payload)
+        logger.info("xd playlist built: %s tracks", len(tracks))
+    return payload
+
+
+async def _peek_xd_bundle(request: Request) -> dict:
+    cached = load_xd_cache()
+    if cached and cached.get("tracks"):
+        return cached
+    try:
+        return await asyncio.wait_for(get_or_build_xd(request), timeout=2.0)
+    except asyncio.TimeoutError:
+        _spawn_bg(get_or_build_xd(request))
+        return empty_xd_bundle()
+    except Exception as e:
+        logger.warning("xd peek failed: %s", e)
+        return empty_xd_bundle()
+
+
+async def _load_xd_bundle(request: Request) -> dict:
+    cached = load_xd_cache()
+    if cached and cached.get("tracks"):
+        return cached
+    try:
+        return await asyncio.wait_for(get_or_build_xd(request), timeout=20.0)
+    except asyncio.TimeoutError:
+        cached = load_xd_cache()
+        if cached and cached.get("tracks"):
+            return cached
+        return empty_xd_bundle()
+    except Exception as e:
+        logger.warning("xd load failed: %s", e)
+        return empty_xd_bundle()
+
+
+# === 管理界面（/_ext/admin）===
+# 配置项 schema：UI 完全由后端 schema 驱动。groups 决定区域划分与顺序。
+ADMIN_GROUPS = [
+    {
+        "id": "playlist", "title": "歌单管理", "icon": "♪",
+        "desc": "在线歌单与音源总开关。",
+        "items": [
+            {"env": "FNMUSIC_NETEASE_ENABLED", "conf": "netease_enabled", "type": "bool",
+             "label": "网易云音源 / 每日推荐", "desc": "开启后网易云在线曲库与「每日推荐」生效；心动歌单也依赖此项。"},
+            {"env": "FNMUSIC_LX_ENABLED", "conf": "lx_enabled", "type": "bool",
+             "label": "洛雪音源（第三音源）", "desc": "酷狗 / 网易 / 咪咕等洛雪聚合音源。"},
+            {"env": "FNMUSIC_MUSICDL_ENABLED", "conf": "musicdl_enabled", "type": "bool",
+             "label": "音乐猫音源", "desc": "音乐猫在线音源。"},
+            {"env": "FNMUSIC_XMLY_ENABLED", "conf": "xmly_enabled", "type": "bool",
+             "label": "喜马拉雅音源（有声书）", "desc": "一个专辑=一部小说=一个歌单。App 搜索框输入「小说 书名」即只走喜马拉雅；VIP 章节需先在「音源」页扫码登录喜马拉雅。"},
+        ],
+    },
+    {
+        "id": "download", "title": "下载管理", "icon": "↓",
+        "desc": "边听边存、收藏/播放落盘与取消收藏清理。",
+        "items": [
+            {"env": "FNMUSIC_TEE_SAVE_ENABLED", "conf": "tee_save_enabled", "type": "bool",
+             "label": "边听边存", "desc": "播放在线歌曲时同时存入飞牛曲库（默认开）。"},
+            {"env": "FNMUSIC_TEE_SAVE_DIR", "conf": "tee_save_dir", "type": "text",
+             "label": "边听边存保存路径", "desc": "留空=自动探测飞牛共享曲库；填了以填写为准。"},
+            {"env": "FNMUSIC_TEE_CACHE_MAX", "conf": "tee_cache_max", "type": "int",
+             "label": "滚动试听缓存首数", "desc": "仅关闭边听边存时生效：完整试听的最近 N 首滚动缓存。"},
+            {"env": "FNMUSIC_TEE_FAVORITES_ONLY", "conf": "tee_favorites_only", "type": "bool",
+             "label": "仅收藏落盘", "desc": "只对收藏的在线曲目落盘，其余只试听不入库。"},
+            {"env": "FNMUSIC_FAV_DL_ON_FAVORITE", "conf": "fav_dl_on_favorite", "type": "bool",
+             "label": "收藏即下载", "desc": "收藏在线曲目时立即整轨下载到曲库。"},
+            {"env": "FNMUSIC_FAV_DL_ON_PLAY", "conf": "fav_dl_on_play", "type": "bool",
+             "label": "播放即下载", "desc": "播放在线曲目时整轨下载到曲库。"},
+            {"env": "FNMUSIC_FAV_DELETE_ON_UNFAV", "conf": "fav_dl_delete_on_unfav", "type": "bool",
+             "label": "取消收藏即删除", "desc": "取消收藏时删除对应音频 / 歌词 / 引用，保持曲库干净。"},
+            {"env": "FNMUSIC_FAV_DL_CONCURRENCY", "conf": "fav_dl_concurrency", "type": "int",
+             "label": "下载并发数", "desc": "同时下载的曲目数。"},
+            {"env": "FNMUSIC_FAV_DL_TIMEOUT_S", "conf": "fav_dl_timeout_s", "type": "int",
+             "label": "下载超时（秒）", "desc": "单首下载超时上限。"},
+            {"env": "FNMUSIC_FAV_DL_MAX_BYTES", "conf": "fav_dl_max_bytes", "type": "mbytes",
+             "label": "单首大小上限（MB）", "desc": "超过此大小的曲目跳过下载。"},
+            {"env": "FNMUSIC_FAV_DIR", "conf": "fav_dir", "type": "text",
+             "label": "收藏目录", "desc": "在线收藏元数据存储目录。"},
+        ],
+    },
+    {
+        "id": "lyric", "title": "歌词", "icon": "✎",
+        "desc": "歌词归属与孤儿清理。",
+        "items": [
+            {"env": "FNMUSIC_LYRIC_PROMOTE", "conf": "lyric_promote", "type": "bool",
+             "label": "歌词贴身", "desc": "歌词始终跟随音频落盘到曲库同名 sidecar。"},
+            {"env": "FNMUSIC_LYRIC_ORPHAN_GC", "conf": "lyric_orphan_gc", "type": "bool",
+             "label": "孤儿歌词清理", "desc": "定期清理留在缓存目录、曲库已无对应音频的歌词。"},
+            {"env": "FNMUSIC_LYRIC_ORPHAN_GC_MIN_AGE_S", "conf": "lyric_orphan_gc_min_age_s", "type": "int",
+             "label": "孤儿最小年龄（秒）", "desc": "小于此年龄的歌词不会被清理。"},
+            {"env": "FNMUSIC_LYRIC_ORPHAN_GC_INTERVAL_S", "conf": "lyric_orphan_gc_interval_s", "type": "int",
+             "label": "孤儿扫描间隔（秒）", "desc": "清理扫描周期。"},
+        ],
+    },
+    {
+        "id": "search", "title": "搜索", "icon": "🔍",
+        "desc": "搜索结果排序、补全与超时。",
+        "items": [
+            {"env": "FNMUSIC_SEARCH_RANK", "conf": "search_rank", "type": "enum",
+             "options": ["cover_quality", "quality_cover", "off"],
+             "label": "排序模式", "desc": "cover_quality=有海报优先于高音质；quality_cover=反过来；off=不重排。"},
+            {"env": "FNMUSIC_SOURCE_ORDER", "conf": "source_order", "type": "text",
+             "label": "音源搜索优先顺序", "desc": "逗号分隔，搜索按此顺序优先调用与置顶，如 netease,lx,musicdl。改动即时生效。"},
+            {"env": "FNMUSIC_SEARCH_ENRICH", "conf": "search_enrich", "type": "bool",
+             "label": "补全封面与音质", "desc": "搜索时批量补全真实封面与音质档。"},
+            {"env": "FNMUSIC_SEARCH_ENRICH_LIMIT", "conf": "search_enrich_limit", "type": "int",
+             "label": "补全前 N 首", "desc": "只对第一屏前 N 首做补全。"},
+            {"env": "FNMUSIC_SEARCH_ENRICH_WAIT_S", "conf": "search_enrich_wait_s", "type": "float",
+             "label": "补全等待（秒）", "desc": "首屏多等此时长以完成补全。"},
+            {"env": "FNMUSIC_SEARCH_RANK_WAIT_S", "conf": "search_rank_wait_s", "type": "float",
+             "label": "排序等待（秒）", "desc": "首屏多等此时长以完成重排。"},
+            {"env": "FNMUSIC_SEARCH_TIMEOUT", "conf": "search_timeout", "type": "float",
+             "label": "搜索超时（秒）", "desc": "在线搜索整体超时。"},
+            {"env": "FNMUSIC_SEARCH_CACHE_TTL", "conf": "search_cache_ttl", "type": "int",
+             "label": "搜索缓存（秒）", "desc": "搜索结果缓存时长。"},
+            {"env": "FNMUSIC_LATE_PAGE_WAIT_S", "conf": "late_page_wait_s", "type": "float",
+             "label": "末页等待（秒）", "desc": "分页末页额外等待时长。"},
+            {"env": "FNMUSIC_ONLINE_LIMIT", "conf": "online_limit", "type": "int",
+             "label": "在线结果数", "desc": "每页在线结果数量。"},
+            {"env": "FNMUSIC_NETEASE_SEARCH_LIMIT", "conf": "netease_search_limit", "type": "int",
+             "label": "网易云搜索数", "desc": "单次网易云搜索条数。"},
+            {"env": "FNMUSIC_LX_SEARCH_LIMIT", "conf": "lx_search_limit", "type": "int",
+             "label": "洛雪搜索数", "desc": "单次洛雪搜索条数。"},
+        ],
+    },
+    {
+        "id": "stream", "title": "取流与音源", "icon": "➤",
+        "desc": "播放地址获取、音质与各音源地址。带 * 的项改后需重启服务。",
+        "items": [
+            {"env": "FNMUSIC_NETEASE_DIRECT", "conf": "netease_direct", "type": "bool",
+             "label": "网易云直连取流", "desc": "借登录态直连获取播放地址，更快更稳。"},
+            {"env": "FNMUSIC_NETEASE_QUALITY", "conf": "netease_quality", "type": "enum",
+             "options": ["lossless", "exhigh", "high", "standard"],
+             "label": "网易云音质", "desc": "优先请求的音质档。"},
+            {"env": "FNMUSIC_LX_QUALITY", "conf": "lx_quality", "type": "enum",
+             "options": ["lossless", "320k", "128k"],
+             "label": "洛雪音质", "desc": "洛雪音源优先音质。"},
+            {"env": "FNMUSIC_NETEASE_WAIT_S", "conf": "netease_wait_s", "type": "float",
+             "label": "取流等待（秒）", "desc": "等待取流返回的超时。"},
+            {"env": "FNMUSIC_STREAM_URL_TTL", "conf": "stream_url_ttl", "type": "int",
+             "label": "取流地址缓存（秒）", "desc": "播放地址缓存时长。"},
+            {"env": "FNMUSIC_ONLINE_SOURCES", "conf": "online_sources", "type": "text", "restart": True,
+             "label": "在线音源 *", "desc": "逗号分隔，如 KuwoMusicClient,MiguMusicClient。"},
+            {"env": "FNMUSIC_MUSICBOX_URL", "conf": "musicbox_url", "type": "text", "restart": True,
+             "label": "网易云地址 *", "desc": "musicbox 服务地址。"},
+            {"env": "FNMUSIC_LX_URL", "conf": "lx_url", "type": "text", "restart": True,
+             "label": "洛雪地址 *", "desc": "lxmusic 服务地址。"},
+            {"env": "FNMUSIC_MUSICDL_URL", "conf": "musicdl_url", "type": "text", "restart": True,
+             "label": "音乐猫地址 *", "desc": "musicdl 服务地址。"},
+        ],
+    },
+    {
+        "id": "system", "title": "系统", "icon": "⚙",
+        "desc": "自动扫库、曲库目录、每日推荐 LLM 兜底与管理界面密码。",
+        "items": [
+            {"env": "FNMUSIC_AUTO_SCAN", "conf": "auto_scan", "type": "bool",
+             "label": "自动扫库", "desc": "落盘/删除后主动触发飞牛扫描，曲库即时更新。"},
+            {"env": "FNMUSIC_AUTO_SCAN_DELAY_S", "conf": "auto_scan_delay_s", "type": "float",
+             "label": "扫库延迟（秒）", "desc": "合并窗口延迟。"},
+            {"env": "FNMUSIC_AUTO_SCAN_AUTH_TTL_S", "conf": "auto_scan_auth_ttl_s", "type": "float",
+             "label": "扫库鉴权 TTL（秒）", "desc": "借用的 App 凭证缓存时长。"},
+            {"env": "FNMUSIC_AUTO_SCAN_SCAN_ALL", "conf": "auto_scan_scan_all", "type": "bool",
+             "label": "全量扫库", "desc": "每次触发全量扫描而非增量。"},
+            {"env": "FNMUSIC_LIBRARY_DIR", "conf": "library_dir", "type": "text",
+             "label": "曲库目录", "desc": "留空=自动探测飞牛共享曲库。"},
+            {"env": "FNMUSIC_MERGE_SUGGEST", "conf": "merge_suggest", "type": "bool",
+             "label": "合并建议", "desc": "开启搜索结果合并建议。"},
+            {"env": "FNMUSIC_LLM_BASE_URL", "conf": "llm_base_url", "type": "text",
+             "label": "LLM 兜底地址", "desc": "每日推荐 LLM 兜底模型地址（留空关闭兜底）。"},
+            {"env": "FNMUSIC_LLM_MODEL", "conf": "llm_model", "type": "text",
+             "label": "LLM 模型", "desc": "兜底模型名。"},
+            {"env": "FNMUSIC_LLM_API_KEY", "conf": None, "type": "secret",
+             "label": "LLM 密钥", "desc": "兜底模型 API Key（留空不填）。"},
+            {"env": "FNMUSIC_ADMIN_TOKEN", "conf": None, "type": "secret",
+             "label": "管理界面密码", "desc": "设置后访问管理界面需输入此密码（留空=局域网开放）。"},
+            {"env": "FNMUSIC_ADMIN_PORT", "conf": "admin_port", "type": "int", "restart": True,
+             "label": "管理界面端口", "desc": "独立 TCP 端口，绕过 fnOS Nginx 直接局域网访问（默认 8799，改后重启服务生效）。"},
+        ],
+    },
+]
+SCHEMA_INDEX = {it["env"]: it for g in ADMIN_GROUPS for it in g["items"]}
+_ADMIN_PENDING_RESTART = False
+
+
+def _dotenv_path() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+
+
+def _read_dotenv_value(name: str) -> str:
+    p = _dotenv_path()
+    if not os.path.exists(p):
+        return ""
+    try:
+        for line in open(p, "r", encoding="utf-8").read().splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("export "):
+                continue
+            key, sep, val = s.partition("=")
+            if sep and key == name:
+                words = shlex.split(val, comments=True)
+                return words[0] if words else ""
+    except Exception:
+        pass
+    return ""
+
+
+def _write_dotenv(changes: dict) -> None:
+    """changes: {ENV_NAME: value_str}. 严格单引号格式，兼容 takeover.py 解析。"""
+    p = _dotenv_path()
+    lines = []
+    if os.path.exists(p):
+        try:
+            lines = open(p, "r", encoding="utf-8").read().splitlines()
+        except Exception:
+            lines = []
+    present = set()
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith("#") and not s.startswith("export "):
+            present.add(s.partition("=")[0].strip())
+    out = list(lines)
+    for env, val in changes.items():
+        v = str(val)
+        if "'" in v or "\n" in v:
+            raise ValueError(f"非法配置值: {env}")
+        new_line = f"{env}='{v}'"
+        if env in present:
+            for i, ln in enumerate(out):
+                s = ln.strip()
+                if s and not s.startswith("#") and not s.startswith("export ") and s.partition("=")[0].strip() == env:
+                    out[i] = new_line
+                    break
+        else:
+            out.append(new_line)
+            present.add(env)
+    tmp = f"{p}.{uuid4().hex[:8]}.part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + ("\n" if out else ""))
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _admin_token() -> str:
+    return _read_dotenv_value("FNMUSIC_ADMIN_TOKEN").strip()
+
+
+def _check_admin_auth(request: Request):
+    tok = _admin_token()
+    if not tok:
+        return None
+    provided = (request.headers.get("X-Admin-Token") or request.query_params.get("token") or "").strip()
+    if provided == tok:
+        return None
+    return JSONResponse(content={"code": 401, "msg": "unauthorized"}, status_code=401)
+
+
+def _coerce_value(item: dict, value):
+    t = item["type"]
+    if t == "bool":
+        return str(value).lower() in ("true", "1", "yes", "on")
+    if t == "int":
+        return int(float(value))
+    if t == "float":
+        return float(value)
+    if t == "mbytes":
+        return int(float(value) * 1024 * 1024)
+    return str(value)
+
+
+def _apply_live(env: str, value) -> None:
+    item = SCHEMA_INDEX.get(env)
+    if not item or not item.get("conf"):
+        return
+    ck = item["conf"]
+    t = item["type"]
+    try:
+        if t == "bool":
+            CONF[ck] = str(value).lower() in ("true", "1", "yes", "on")
+        elif t == "int":
+            CONF[ck] = int(float(value))
+        elif t == "float":
+            CONF[ck] = float(value)
+        elif t == "mbytes":
+            CONF[ck] = int(float(value) * 1024 * 1024)
+        elif ck == "source_order":
+            CONF[ck] = [x.strip().lower() for x in str(value).split(",") if x.strip()]
+        else:
+            CONF[ck] = str(value)
+    except Exception as e:
+        logger.warning("live apply failed for %s: %s", env, e)
+
+
+def _current_values() -> dict:
+    vals = {}
+    for env, item in SCHEMA_INDEX.items():
+        if item["type"] == "secret":
+            vals[env] = "***" if _read_dotenv_value(env) else ""
+            continue
+        if item["type"] == "mbytes":
+            raw = CONF.get(item["conf"]) if item.get("conf") else 0
+            vals[env] = int(raw) // (1024 * 1024) if raw else 0
+            continue
+        if item.get("conf") and item["conf"] in CONF:
+            v = CONF[item["conf"]]
+            if item["conf"] == "source_order":
+                vals[env] = ",".join(v) if isinstance(v, list) else str(v)
+            elif isinstance(v, bool):
+                vals[env] = "true" if v else "false"
+            else:
+                vals[env] = str(v)
+        else:
+            vals[env] = _read_dotenv_value(env)
+    return vals
+
+
+_ADMIN_UI_HTML = None
+
+
+def _load_admin_ui_html() -> str:
+    global _ADMIN_UI_HTML
+    if _ADMIN_UI_HTML is None:
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_ui.html"),
+                      "r", encoding="utf-8") as f:
+                _ADMIN_UI_HTML = f.read()
+        except Exception as e:
+            _ADMIN_UI_HTML = f"<p>管理界面文件缺失: {e}</p>"
+    return _ADMIN_UI_HTML
+
+
+async def admin_page(request: Request):
+    return HTMLResponse(content=_load_admin_ui_html(), status_code=200)
+
+
+async def admin_config_get(request: Request):
+    auth_err = _check_admin_auth(request)
+    if auth_err is not None:
+        return auth_err
+    return JSONResponse(content={
+        "code": 0,
+        "schema": ADMIN_GROUPS,
+        "values": _current_values(),
+        "needs_restart": _ADMIN_PENDING_RESTART,
+        "auth": bool(_admin_token()),
+        "restart_required_keys": [it["env"] for it in SCHEMA_INDEX.values() if it.get("restart")],
+    })
+
+
+async def admin_config_put(request: Request):
+    auth_err = _check_admin_auth(request)
+    if auth_err is not None:
+        return auth_err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    changes = body.get("changes") if isinstance(body, dict) else None
+    if not isinstance(changes, dict) or not changes:
+        return JSONResponse(content={"code": 1, "msg": "no changes"}, status_code=400)
+    applied = {}
+    need_restart = False
+    for env, val in changes.items():
+        item = SCHEMA_INDEX.get(env)
+        if not item:
+            return JSONResponse(content={"code": 1, "msg": f"unknown key: {env}"}, status_code=400)
+        try:
+            _coerce_value(item, val)
+        except Exception:
+            return JSONResponse(content={"code": 1, "msg": f"bad value for {env}"}, status_code=400)
+        applied[env] = val
+        _apply_live(env, val)
+        if item.get("restart"):
+            need_restart = True
+    try:
+        _write_dotenv(applied)
+    except Exception as e:
+        return JSONResponse(content={"code": 1, "msg": f"write .env failed: {e}"}, status_code=500)
+    global _ADMIN_PENDING_RESTART
+    _ADMIN_PENDING_RESTART = _ADMIN_PENDING_RESTART or need_restart
+    return JSONResponse(content={"code": 0, "msg": "ok", "values": _current_values(),
+                                 "needs_restart": _ADMIN_PENDING_RESTART})
+
+
+async def admin_restart(request: Request):
+    auth_err = _check_admin_auth(request)
+    if auth_err is not None:
+        return auth_err
+    for cmd in (["systemctl", "restart", "fnmusic-ext"], ["sudo", "systemctl", "restart", "fnmusic-ext"]):
+        try:
+            subprocess.Popen(cmd, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            global _ADMIN_PENDING_RESTART
+            _ADMIN_PENDING_RESTART = False
+            return JSONResponse(content={"code": 0, "msg": "restarting"})
+        except Exception:
+            continue
+    return JSONResponse(content={"code": 1, "msg": "restart failed"}, status_code=500)
+
+
+# 双前缀注册：
+#   /_ext                      —— 直连 takeover socket（调试/内网直连可用）
+#   /music/api/v1/_ext         —— 经 fnOS Nginx 反向代理转发到同一 socket，浏览器可从局域网直接打开
+# 两者共用同一套处理函数；healthz 仅在转发前缀下额外挂一份（/_ext/healthz 已由原端点提供）。
+# 三前缀注册（同一套处理器）：
+#   /music/api/v1/admin            —— 经 fnOS Nginx 转发，浏览器首选短地址
+#   /music/api/v1/_ext/admin       —— 同上（旧地址，保留兼容）
+#   /_ext/admin                    —— 直连 takeover socket（调试用）
+for _ADMIN_BASE in ("/music/api/v1/admin", "/music/api/v1/_ext/admin", "/_ext/admin"):
+    app.add_api_route(_ADMIN_BASE, admin_page, methods=["GET"])
+    app.add_api_route(_ADMIN_BASE + "/api/config", admin_config_get, methods=["GET"])
+    app.add_api_route(_ADMIN_BASE + "/api/config", admin_config_put, methods=["PUT"])
+    app.add_api_route(_ADMIN_BASE + "/api/restart", admin_restart, methods=["POST"])
+# healthz 转发别名（/_ext/healthz 已由原端点提供）
+app.add_api_route("/music/api/v1/healthz", ext_healthz, methods=["GET"])
+app.add_api_route("/music/api/v1/_ext/healthz", ext_healthz, methods=["GET"])
+
+# 音源管理：网易扫码登录 + 各音源状态（与独立端口共用同步核心函数）
+async def admin_sources_get(request: Request):
+    return JSONResponse(content=_admin_sources_payload())
+
+async def admin_netease_status_get(request: Request):
+    return JSONResponse(content=_admin_netease_status())
+
+async def admin_netease_qr_post(request: Request):
+    return JSONResponse(content=_admin_netease_qr())
+
+async def admin_netease_check_get(request: Request):
+    unikey = (request.query_params.get("unikey") or "").strip()
+    if not unikey:
+        return JSONResponse(content={"code": 400, "msg": "unikey required"}, status_code=400)
+    return JSONResponse(content=_admin_netease_check(unikey))
+
+async def admin_playlists_get(request: Request):
+    return JSONResponse(content=_admin_playlists_payload())
+
+
+async def admin_playlists_search_get(request: Request):
+    """歌单综合搜索：`GET ...?q=<关键字>&limit=<n>`"""
+    q = (request.query_params.get("q") or request.query_params.get("keyword") or "").strip()
+    try:
+        limit = int(request.query_params.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    try:
+        return JSONResponse(content=_admin_playlists_search(q, limit))
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(content={"code": 1, "msg": str(e), "q": q, "results": []})
+
+
+async def admin_playlists_dims_get(request: Request):
+    """歌单生成器的可选维度（地区/心情/语言/规模）。"""
+    return JSONResponse(content=_admin_playlists_dims())
+
+
+async def admin_playlists_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    return JSONResponse(content=_admin_playlists_post(body))
+
+for _NB in ("/music/api/v1/admin", "/music/api/v1/_ext/admin", "/_ext/admin"):
+    app.add_api_route(_NB + "/api/sources", admin_sources_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/netease/status", admin_netease_status_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/netease/qr", admin_netease_qr_post, methods=["POST"])
+    app.add_api_route(_NB + "/api/netease/qr/check", admin_netease_check_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/playlists", admin_playlists_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/playlists", admin_playlists_post, methods=["POST"])
+    app.add_api_route(_NB + "/api/playlists/search", admin_playlists_search_get, methods=["GET"])
+    app.add_api_route(_NB + "/api/playlists/dims", admin_playlists_dims_get, methods=["GET"])
+
+
+# === 管理控制台独立 TCP 端口（绕过 fnOS Nginx，局域网直连）===
+# 用 Python 标准库 http.server 直接监听 0.0.0.0:admin_port，零外部依赖、稳定可靠；
+# 音乐 API 仍只走 takeover socket（经 fnOS Nginx），不被该端口暴露。
+# 同一套处理函数经 FastAPI 路由仍挂在原前缀下，兼容旧访问方式（nginx / socket 直连）。
+import json as _ajson
+from urllib.parse import urlparse as _aurlparse, parse_qs as _aparse_qs
+from http.server import BaseHTTPRequestHandler as _AdminBaseHandler, ThreadingHTTPServer as _AdminHTTPServer
+
+def _admin_auth_ok(headers: dict, query: dict) -> bool:
+    tok = _admin_token()
+    if not tok:
+        return True
+    provided = (headers.get("X-Admin-Token") or query.get("token") or "").strip()
+    return provided == tok
+
+
+def _admin_apply_changes_sync(changes: dict):
+    """返回 (err_dict_or_None, need_restart)。"""
+    applied = {}
+    need_restart = False
+    for env, val in changes.items():
+        item = SCHEMA_INDEX.get(env)
+        if not item:
+            return {"code": 1, "msg": f"unknown key: {env}"}, False
+        try:
+            _coerce_value(item, val)
+        except Exception:
+            return {"code": 1, "msg": f"bad value for {env}"}, False
+        applied[env] = val
+        _apply_live(env, val)
+        if item.get("restart"):
+            need_restart = True
+    try:
+        _write_dotenv(applied)
+    except Exception as e:
+        return {"code": 1, "msg": f"write .env failed: {e}"}, False
+    global _ADMIN_PENDING_RESTART
+    _ADMIN_PENDING_RESTART = _ADMIN_PENDING_RESTART or need_restart
+    return None, need_restart
+
+
+def _admin_do_restart_sync() -> bool:
+    for cmd in (["systemctl", "restart", "fnmusic-ext"], ["sudo", "systemctl", "restart", "fnmusic-ext"]):
+        try:
+            subprocess.Popen(cmd, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            global _ADMIN_PENDING_RESTART
+            _ADMIN_PENDING_RESTART = False
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _healthz_payload() -> dict:
+    # 独立端口的健康检查：同步、即时、零跨事件循环依赖。
+    # 完整依赖探测（带上游/各音源实时探活）请在 fnOS Nginx 下访问 /music/api/v1/healthz。
+    try:
+        return {
+            "ok": True,
+            "version": get_version(),
+            "netease_direct": _netease_direct_stats(),
+            "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
+            "upstream": {"status": "n/a", "note": "见 /music/api/v1/healthz"},
+            "musicbox": {"status": "ok" if CONF.get("netease_enabled", True) else "disabled"},
+            "lxmusic": {"status": "ok" if CONF.get("lx_enabled", True) else "disabled"},
+            "musicdl": {"status": "ok" if CONF.get("musicdl_enabled", True) else "disabled"},
+            "recommend": {
+                "mode": "source-native",
+                "netease": bool(CONF.get("netease_enabled", True)),
+                "lx": bool(CONF.get("lx_enabled", True)),
+                "llm_fallback": dailyrec.llm_enabled() and not CONF.get("netease_enabled", True),
+                "recent": dailyrec.last_recommend_summary(),
+            },
+            "degraded": True,
+            "note": "独立端口精简探测；完整状态见 /music/api/v1/healthz",
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "version": get_version()}
+
+
+# === 音源管理：网易云扫码登录桥接 + 各音源状态（同步，零依赖）===
+def _mb_http(method: str, path: str, data=None, timeout: float = 8.0):
+    """同步调用 musicbox 本地 HTTP API（标准库 urllib，零依赖）。返回 (status, dict|None, raw_text)。"""
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    import json as _uj
+    base = str(CONF.get("musicbox_url") or "http://127.0.0.1:8770").rstrip("/")
+    url = base + path
+    body = None
+    headers = {"Accept": "application/json"}
+    if method.upper() in ("POST", "PUT") and data is not None:
+        body = _uj.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = _ureq.Request(url, data=body, headers=headers, method=method.upper())
+    try:
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except _uerr.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        status = e.code
+    except Exception as e:  # noqa: BLE001
+        return -1, None, str(e)
+    try:
+        return status, _uj.loads(raw), raw
+    except Exception:
+        return status, None, raw
+
+
+def _probe_source_health(url: str, timeout: float = 2.0) -> str:
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    try:
+        req = _ureq.Request(str(url).rstrip("/") + "/healthz", headers={"Accept": "application/json"})
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            return "ok" if resp.status == 200 else "fail"
+    except _uerr.HTTPError:
+        return "fail"
+    except Exception:
+        return "unreachable"
+
+
+# ======================== v76 喜马拉雅（xmly）音源 ========================
+# 设计约定（用户选定）：
+#   · 一个歌单 = 一部小说 = 喜马拉雅的一个专辑
+#   · 搜索带触发词（「小说 xxx」/「喜马拉雅 xxx」/「xmly xxx」）时，只调喜马拉雅
+#   · 扫码登录只为了拿 VIP 取流凭证，暂不同步订阅/历史
+XMLY_PLAYLIST_PREFIX = "online:playlist:xmly:"   # 歌单（专辑）guid： + albumId
+XMLY_TRACK_PREFIX = "online:xmly:"               # 单集 guid：  + trackId:albumId
+XMLY_TRIGGERS = ("小说", "喜马拉雅", "xmly")
+# 专辑曲目缓存：albumId -> {"ts": float, "by_id": {trackId: row}, "rows": [row]}
+_XMLY_ALBUM_CACHE: dict[str, dict] = {}
+_XMLY_CACHE_TTL = 900.0
+
+
+def is_xmly_playlist_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(XMLY_PLAYLIST_PREFIX)
+
+
+def _xmly_album_id_from_guid(guid: str) -> str:
+    return str(guid or "")[len(XMLY_PLAYLIST_PREFIX):].strip()
+
+
+def is_xmly_track_guid(guid: str | None) -> bool:
+    return str(guid or "").startswith(XMLY_TRACK_PREFIX)
+
+
+def _xmly_track_ids(guid: str) -> tuple[str, str]:
+    """online:xmly:<trackId>:<albumId> -> (albumId, trackId)；解析失败返回 ("","")。"""
+    tail = str(guid or "")[len(XMLY_TRACK_PREFIX):]
+    parts = [p for p in tail.split(":") if p]
+    if len(parts) >= 2:
+        return parts[1], parts[0]
+    return "", (parts[0] if parts else "")
+
+
+def _xmly_trigger(keyword: str) -> str:
+    """命中触发词返回**去掉触发词后**的真实关键字；否则返回 ""。"""
+    kw = str(keyword or "").strip()
+    if not kw:
+        return ""
+    low = kw.lower()
+    for t in XMLY_TRIGGERS:
+        if low.startswith(t):
+            rest = kw[len(t):].strip()
+            if rest:
+                return rest
+    return ""
+
+
+def _xmly_http(method: str, path: str, data=None, timeout: float = 20.0):
+    """同步调用 xmly-service（同 _mb_http，返回 (status, dict|None, raw)）。"""
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    import json as _uj
+    base = str(CONF.get("xmly_url") or "http://127.0.0.1:8774").rstrip("/")
+    body = None
+    headers = {"Accept": "application/json"}
+    if method.upper() in ("POST", "PUT") and data is not None:
+        body = _uj.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = _ureq.Request(base + path, data=body, headers=headers, method=method.upper())
+    try:
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except _uerr.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        status = e.code
+    except Exception as e:  # noqa: BLE001
+        return -1, None, str(e)
+    try:
+        return status, _uj.loads(raw), raw
+    except Exception:
+        return status, None, raw
+
+
+async def _xmly_aget(path: str, params: dict, timeout: float = 25.0) -> dict:
+    """异步 GET xmly-service，返回解析后的 dict（失败返回 {}）。"""
+    import httpx as _httpx
+    base = str(CONF.get("xmly_url") or "http://127.0.0.1:8774").rstrip("/")
+    try:
+        async with _httpx.AsyncClient(base_url=base, timeout=timeout) as cli:
+            r = await cli.get(path, params=params)
+            return r.json() if r.status_code == 200 else {}
+    except Exception as e:  # noqa: BLE001
+        logger.debug("xmly %s failed: %s", path, e)
+        return {}
+
+
+async def _xmly_search_albums(keyword: str, limit: int = 20) -> list[dict]:
+    """搜索专辑（一部小说 = 一个专辑 = 一个歌单）。"""
+    if not _xmly_trigger(keyword) and not keyword:
+        return []
+    kw = _xmly_trigger(keyword) or keyword
+    j = await _xmly_aget("/api/v1/search", {"keyword": kw, "limit": max(1, min(int(limit), 50))})
+    arr = j.get("albums") or []
+    return [a for a in arr if isinstance(a, dict) and a.get("albumId")]
+
+
+async def _xmly_album_rows(album_id, max_pages: int = 60, cache_only_first_page: bool = False) -> list[dict]:
+    """取专辑声音（带 15 分钟缓存）。命中缓存 0 请求。
+
+    ★ max_pages 很关键：一部小说动辄上千集（每页 30 条）。搜索结果只需要第一集来
+      「代表这部小说」，如果这里拉满会把一次搜索变成几十次 HTTP。
+      完整的章节拉取只发生在用户真正点开歌单时（playlist_track_list）。
+      ★ cache_only_first_page：只写第一页进缓存时不要污染整张专辑的缓存。
+    """
+    aid = str(album_id or "").strip()
+    if not aid:
+        return []
+    cache = _XMLY_ALBUM_CACHE.get(aid)
+    if cache and time.time() - float(cache.get("ts") or 0) < _XMLY_CACHE_TTL:
+        rows = list(cache.get("rows") or [])
+        # 缓存完整时按页切片返回，避免「只想要第一页」的场景白传一大坨数据
+        if max_pages != 60:
+            return rows[: max_pages * 30]
+        return rows
+    j = await _xmly_aget("/api/v1/album/tracks",
+                         {"albumId": aid, "max_pages": max(1, int(max_pages))}, timeout=90.0)
+    rows = [r for r in (j.get("tracks") or []) if isinstance(r, dict) and r.get("trackId")]
+    if rows:
+        if rows and not cache_only_first_page:
+            _XMLY_ALBUM_CACHE[aid] = {
+                "ts": time.time(),
+                "rows": rows,
+                "by_id": {str(r.get("trackId")): r for r in rows},
+                "total": int(j.get("total") or len(rows)),
+            }
+    elif cache:  # 拿不到新数据时宁可用旧的，别让用户突然空歌单
+        return list(cache.get("rows") or [])
+    return rows
+
+
+async def _xmly_album_detail(album_id) -> dict:
+    aid = str(album_id or "").strip()
+    if not aid:
+        return {}
+    j = await _xmly_aget("/api/v1/album/detail", {"albumId": aid})
+    return (j.get("album") or {}) if isinstance(j, dict) else {}
+
+
+async def _xmly_playlist_cover(album_id) -> str:
+    """喜马拉雅歌单（= 一部小说 = 一个专辑）的海报。
+
+    优先专辑封面；拿不到（少数专辑 detail 里没 cover）就退回第一集的封面。
+    ★ 返回的一定是绝对 https 地址（// 开头与相对路径都会被补全）。
+    """
+    aid = str(album_id or "").strip()
+    if not aid:
+        return ""
+    try:
+        det = await _xmly_album_detail(aid)
+        c = _xmly_abs_cover(str(det.get("cover") or ""))
+        if c:
+            return c
+        rows = await _xmly_album_rows(aid, max_pages=1, cache_only_first_page=True)
+        for r in rows:
+            c = _xmly_abs_cover(str(r.get("cover") or ""))
+            if c:
+                return c
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _warm_xmly_poster(pguid: str, cover_url: str = "") -> None:
+    """喜马拉雅歌单海报预热。
+
+    歌单卡片用的是大图（客户端按 size=600 拉）。不预热的话等客户端来拉时才现抓，
+    海报位会先显示成灰块 —— 与每日推荐（`_warm_daily_poster`）同一套道理。
+    ★ 先把封面写进 meta 缓存，就能直接复用既有的 `_warm_cover` 预热链路。
+    """
+    try:
+        g = str(pguid or "")
+        if not g.startswith(XMLY_PLAYLIST_PREFIX):
+            return
+        if cover_url:
+            _meta_set(g, {"cover_url": cover_url})
+        for b in (600, 300):
+            _prefetch_online_covers([{"guid": g}], size=b)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _xmly_row_to_item(row: dict, album: dict | None = None) -> dict:
+    """把喜马拉雅的一集转成 proxy 内部的 online item（供 build_online_track 使用）。
+
+    guid = online:xmly:<trackId>:<albumId>
+      ↳ source_from_online_guid 取 parts[1] = "xmly"，与 netease/lx 同构。
+    """
+    album = album or {}
+    tid = str(row.get("trackId") or "")
+    aid = str(row.get("albumId") or album.get("albumId") or "")
+    title = str(row.get("title") or "").strip()
+    artist = str(row.get("anchorName") or album.get("author") or "喜马拉雅").strip()
+    album_name = str(row.get("albumTitle") or album.get("title") or "").strip()
+    cover = str(row.get("cover") or album.get("cover") or "")
+    try:
+        dur = int(row.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0
+    return {
+        "source": "xmly",
+        # online_guid_from_item 见到含 ":" 的 id 会拼成 online:<id>，所以这里不带前缀
+        "id": "xmly:{}:{}".format(tid, aid),
+        "guid": XMLY_TRACK_PREFIX + "{}:{}".format(tid, aid),
+        "title": title,
+        "artist": artist,
+        "album": album_name,
+        "cover_url": cover,
+        "duration_s": dur,
+        "ext": "m4a",
+        "track_id": tid,
+        "album_id": aid,
+        "play_urls_cache": {},
+    }
+
+
+async def _xmly_album_to_playlist_record(album_id) -> dict:
+    """组装 App 歌单记录：{guid,name,coverId,createdAt,updatedAt,trackCount,isDaily}。
+
+    ★★ coverId 必须是**能走 /music/api/v1/static/cover 的 guid**，绝不能填外链 URL。
+      v76 实测：coverId 填 `https://imagev2.xmcdn.com/...` 时，App 拿这个外链去请求
+      封面接口 → 解析不出在线 guid → 落到上游 → 401/404 ⇒ **歌单海报整块空白**。
+      这里统一用歌单 guid 自己，并在 /static/cover 里按 albumId 反查真实封面
+      （与每日推荐 `coverId = guid` 的做法一致）。
+    """
+    detail = await _xmly_album_detail(album_id)
+    aid = str(album_id)
+    pguid = XMLY_PLAYLIST_PREFIX + aid
+    name = str(detail.get("title") or "")
+    cover = _xmly_abs_cover(str(detail.get("cover") or ""))
+    rows: list[dict] = []
+    if not name or not cover:
+        # 详情拿不到（偶发风控）时兜底翻第一页，不拉满整张专辑
+        rows = await _xmly_album_rows(aid, max_pages=1, cache_only_first_page=True)
+        if not name:
+            name = str((rows[0].get("albumTitle") if rows else "") or "喜马拉雅专辑")
+        if not cover and rows:
+            cover = _xmly_abs_cover(str(rows[0].get("cover") or ""))
+    total = int(detail.get("trackCount") or 0) or len(rows)
+    ts = int(time.time())
+    if cover:
+        _warm_xmly_poster(pguid, cover)
+    return {
+        "guid": pguid,
+        "name": name,
+        "coverId": pguid,
+        "createdAt": ts,
+        "updatedAt": ts,
+        "trackCount": total,
+        "isDaily": False,
+    }
+
+
+async def _xmly_playlist_tracks(album_id) -> list[dict]:
+    """专辑全部期数 → App 可播曲目列表。"""
+    rows = await _xmly_album_rows(album_id)
+    detail = await _xmly_album_detail(album_id)
+    album = {"albumId": album_id, "title": detail.get("title") or "",
+             "author": detail.get("author") or "", "cover": detail.get("cover") or ""}
+    out = []
+    for row in rows:
+        item = _xmly_row_to_item(row, album)
+        try:
+            out.append(build_online_track(item))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _xmly_abs_cover(url: str) -> str:
+    """喜马拉雅封面常见 "//imagev2.xmcdn.com/..." 或相对路径，统一补成 https 绝对地址。"""
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("http"):
+        return u
+    return "https://imagev2.xmcdn.com/" + u.lstrip("/")
+
+
+def _admin_xmly_status() -> dict:
+    status, payload, _ = _xmly_http("GET", "/api/v1/auth/status", timeout=10)
+    if isinstance(payload, dict):
+        return {"logged_in": bool(payload.get("logged_in")),
+                "nickname": payload.get("nickname") or "",
+                "uid": payload.get("uid") or "",
+                "is_vip": bool(payload.get("is_vip")),
+                "error": "" if status == 200 else "service {}".format(status)}
+    return {"logged_in": False, "nickname": "", "uid": "", "is_vip": False,
+            "error": "xmly service unreachable ({})".format(status)}
+
+
+
+def _admin_netease_status() -> dict:
+    nd = _netease_direct_stats()
+    status, payload, _ = _mb_http("GET", "/api/v1/auth/status")
+    if isinstance(payload, dict):
+        d = payload.get("data", payload)
+        return {
+            "logged_in": bool(d.get("logged_in")),
+            "nickname": d.get("nickname") or "",
+            "avatar": d.get("avatar") or "",
+            "uid": d.get("uid") or "",
+            "cookie_ok": bool(nd.get("cookie_ok")) or bool(d.get("logged_in")),
+        }
+    return {"logged_in": bool(nd.get("cookie_ok")), "nickname": "",
+            "cookie_ok": bool(nd.get("cookie_ok")), "error": f"musicbox status {status}"}
+
+
+def _admin_netease_qr() -> dict:
+    _, payload, _ = _mb_http("POST", "/api/v1/auth/login", timeout=20)
+    if isinstance(payload, dict):
+        d = payload.get("data", payload)
+        return {"unikey": d.get("unikey") or "", "qr_ascii": d.get("qr_ascii") or "",
+                "qr_url": d.get("qr_url") or ""}
+    return {"unikey": "", "qr_ascii": "", "qr_url": "", "error": "qr fetch failed"}
+
+
+def _admin_netease_check(unikey: str) -> dict:
+    from urllib.parse import quote as _q
+    status, payload, _ = _mb_http("GET", "/api/v1/auth/login/check?unikey=" + _q(str(unikey)), timeout=8)
+    if isinstance(payload, dict):
+        d = payload.get("data", payload)
+        return {"code": d.get("code"), "message": d.get("message") or "",
+                "logged_in": bool(d.get("logged_in")), "nickname": d.get("nickname") or ""}
+    return {"code": -1, "message": f"check failed {status}", "logged_in": False}
+
+
+def _admin_sources_payload() -> dict:
+    ne = _admin_netease_status()
+    mb_enabled = bool(CONF.get("netease_enabled", True))
+    lx_enabled = bool(CONF.get("lx_enabled", True))
+    md_enabled = bool(CONF.get("musicdl_enabled", True))
+    xmly_enabled = bool(CONF.get("xmly_enabled", True))
+    xm = _admin_xmly_status()
+    return {
+        "code": 0,
+        "netease": {
+            "enabled": mb_enabled,
+            "logged_in": ne.get("logged_in"), "nickname": ne.get("nickname"),
+            "avatar": ne.get("avatar"), "uid": ne.get("uid"),
+            "cookie_ok": ne.get("cookie_ok"),
+        },
+        "musicbox": {"enabled": mb_enabled,
+                     "health": _probe_source_health(CONF.get("musicbox_url", "http://127.0.0.1:8770")) if mb_enabled else "disabled"},
+        "lx": {"enabled": lx_enabled,
+               "health": _probe_source_health(CONF.get("lx_url", "http://127.0.0.1:8772")) if lx_enabled else "disabled"},
+        "musicdl": {"enabled": md_enabled,
+                    "health": _probe_source_health(CONF.get("musicdl_url", "http://127.0.0.1:8768")) if md_enabled else "disabled"},
+        # v76 喜马拉雅：有声书/小说 —— 一个歌单 = 一部小说 = 一个专辑
+        "xmly": {"enabled": xmly_enabled,
+                 "health": _probe_source_health(CONF.get("xmly_url", "http://127.0.0.1:8774")) if xmly_enabled else "disabled",
+                 "logged_in": xm.get("logged_in"), "nickname": xm.get("nickname"),
+                 "is_vip": xm.get("is_vip"), "error": xm.get("error") or ""},
+        # v59 音源搜索优先顺序（当前生效）
+        "order": list(CONF.get("source_order") or ["netease", "lx", "musicdl"]),
+    }
+
+
+def _musicbox_toplist() -> list:
+    """同步拉取网易云排行榜（musicbox /api/v1/toplist），返回 [{id,name,index}] 列表。
+
+    ★ 榜单取曲必须用 index（`/api/v1/toplist?index=N`）；
+    `/api/v1/playlist/{id}` 走 musicbox `playlist show` 需要网易云 token，实测恒返回
+    `{"code":99999,"msg":"INVALID TOKEN"}`（data=null）⇒ 拿不到曲目。故这里保留 index。
+    """
+    try:
+        status, payload, _ = _mb_http("GET", "/api/v1/toplist", timeout=8)
+        if status != 200 or not isinstance(payload, dict):
+            return []
+        arr = payload.get("data") or []
+        if not isinstance(arr, list):
+            return []
+        out = []
+        for i, p in enumerate(arr):
+            if not isinstance(p, dict):
+                continue
+            try:
+                idx = int(p.get("index"))
+            except (TypeError, ValueError):
+                idx = i
+            out.append({"id": p.get("id"), "name": p.get("name"), "index": idx})
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _musicbox_toplist_tracks(index: int, limit: int = 100) -> list:
+    """同步取某网易云榜单（index）的曲目；字段：song_id/name/artist/album_name/album_pic_url/duration_ms。"""
+    try:
+        status, payload, _ = _mb_http(
+            "GET", "/api/v1/toplist?index=%d&limit=%d" % (int(index), int(limit)), timeout=15)
+        if status != 200 or not isinstance(payload, dict):
+            return []
+        arr = payload.get("data") or []
+        return arr if isinstance(arr, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _netease_toplist_for(source_id: str) -> dict:
+    """把「网易云榜单 id」映射到榜单条目（含 index）。找不到返回 {}。"""
+    sid = str(source_id or "").strip()
+    if not sid:
+        return {}
+    for it in _musicbox_toplist():
+        if str(it.get("id")) == sid:
+            return it
+    return {}
+
+
+def _user_playlist_track_count(source: str, source_id: str) -> int:
+    """轻量取「该源歌单可用曲目数」（只取原始候选，不做取流解析），供加入时落盘 track_count。
+
+    失败一律返回 0（不影响加入动作本身，曲目仍会在播放时按需解析）。
+    """
+    src = str(source or "").strip().lower()
+    sid = str(source_id or "").strip()
+    if not sid:
+        return 0
+    try:
+        if src == "netease":
+            info = _netease_toplist_for(sid)
+            idx = info.get("index")
+            if idx is not None:
+                return len(_musicbox_toplist_tracks(idx, limit=100))
+            # 非榜单（搜索加入的歌单）→ `/api/v1/playlist/{id}`，★ 很慢（15~60s）故走缓存
+            return _cached_track_count(src, sid, lambda: len(
+                _musicbox_playlist_tracks_sync(sid, timeout=60)))
+        if src == "kuwo":
+            if _kuwo_is_bang(sid):
+                return len(_kuwo_bang_tracks(sid, want=60))
+            return len(_kuwo_playlist_tracks(sid, want=60))
+        if src == "ai":
+            # AI 预设：组装一次即可（内部有磁盘缓存，重复调用不会反复拉榜）
+            return _cached_track_count(src, sid, lambda: len(_build_ai_tracks(sid)))
+        if src == CUSTOM_SOURCE:
+            # 生成器歌单：同样有磁盘缓存；刚生成过会直接命中，不再拉榜
+            return _cached_track_count(src, sid, lambda: len(_build_custom_tracks(sid)))
+        if src == "xmly":
+            # v77 喜马拉雅：一部小说 = 一个专辑。曲目数直接读专辑详情（1 次 HTTP，很快），
+            # 不去拉整张专辑（可能上千集）—— 这里只要个数字。
+            def _xmly_count():
+                _st, _p, _raw = _xmly_http(
+                    "GET", "/api/v1/album/detail?albumId=" + quote(str(sid)), timeout=20)
+                try:
+                    return int(((_p or {}).get("album") or {}).get("trackCount") or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return _cached_track_count(src, sid, _xmly_count)
+    except Exception:  # noqa: BLE001
+        return 0
+    return 0
+
+
+# 慢速曲目数查询缓存：key=(source, source_id) -> (过期时间戳, 曲目数)
+_PL_COUNT_CACHE: dict = {}
+_PL_COUNT_TTL = 900.0  # 15 分钟
+
+
+def _cached_track_count(source: str, source_id: str, compute) -> int:
+    """缓存慢速曲目数查询（网易 `/api/v1/playlist/{id}` 实测 15~60s）。
+
+    避免每次打开管理台列表、或自愈逻辑都去阻塞几十秒。
+    """
+    import time as _t
+    key = (str(source), str(source_id))
+    now = _t.time()
+    hit = _PL_COUNT_CACHE.get(key)
+    if hit and hit[0] > now:
+        return int(hit[1] or 0)
+    try:
+        val = int(compute() or 0)
+    except Exception:  # noqa: BLE001
+        val = 0
+    _PL_COUNT_CACHE[key] = (now + _PL_COUNT_TTL, val)
+    return val
+
+
+KUWO_BANG_MENU_URL = "http://wapi.kuwo.cn/api/www/bang/bang/bangMenu"
+KUWO_BANG_MUSIC_URL = "http://wapi.kuwo.cn/api/www/bang/bang/musicList"
+# ★ 用户歌单详情（搜索出来的歌单）：端点名是 playListInfo（大写 L），/playlistInfo 是 404
+KUWO_PLAYLIST_INFO_URL = "http://wapi.kuwo.cn/api/www/playlist/playListInfo"
+# 歌单搜索（按关键字搜酷我歌单）
+KUWO_SEARCH_PLAYLIST_URL = "http://wapi.kuwo.cn/api/www/search/searchPlayListBykeyWord"
+KUWO_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _kuwo_http(url: str, timeout: float = 10.0):
+    """同步 GET 酷我公开 API（标准库 urllib，零依赖）。返回 (status, dict|None, raw)。"""
+    import urllib.request as _ureq
+    import urllib.error as _uerr
+    import json as _uj
+    req = _ureq.Request(url, headers={"Accept": "application/json", "User-Agent": KUWO_UA})
+    try:
+        with _ureq.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = resp.status
+    except _uerr.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        status = e.code
+    except Exception as e:  # noqa: BLE001
+        return -1, None, str(e)
+    try:
+        return status, _uj.loads(raw), raw
+    except Exception:
+        return status, None, raw
+
+
+def _kuwo_bang_menu() -> list:
+    """酷我榜单菜单（实测 5 分类 / 36 榜）。返回 [{id,name,cat}]，id 即 musicList 用的 bangId(sourceid)。"""
+    try:
+        status, payload, _ = _kuwo_http(KUWO_BANG_MENU_URL, timeout=10)
+        if status != 200 or not isinstance(payload, dict):
+            return []
+        out = []
+        for cat in (payload.get("data") or []):
+            if not isinstance(cat, dict):
+                continue
+            cat_name = str(cat.get("name") or "")
+            for b in (cat.get("list") or []):
+                if not isinstance(b, dict):
+                    continue
+                bid = str(b.get("sourceid") or b.get("bangId") or "").strip()
+                # ★ 酷我返回的歌单名可能含 HTML 实体（如 Jay&nbsp;Chou），必须解码否则前端显示乱码
+                nm = _html.unescape(str(b.get("name") or "").strip())
+                if bid and nm:
+                    out.append({"id": bid, "name": nm, "cat": cat_name})
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _kuwo_bang_tracks(bang_id: str, want: int = 60) -> list:
+    """酷我榜单曲目。★ rn 上限 30（rn>30 服务端返回空 body），故固定 rn=30 并用 pn 翻页。"""
+    import urllib.parse as _up
+    out = []
+    pn = 1
+    rn = 30
+    while len(out) < want and pn <= 4:
+        url = KUWO_BANG_MUSIC_URL + "?" + _up.urlencode({"bangId": bang_id, "pn": pn, "rn": rn})
+        status, payload, _ = _kuwo_http(url, timeout=10)
+        if status != 200 or not isinstance(payload, dict):
+            break
+        ml = ((payload.get("data") or {}).get("musicList") or [])
+        if not isinstance(ml, list) or not ml:
+            break
+        for t in ml:
+            if not isinstance(t, dict):
+                continue
+            rid = str(t.get("rid") or t.get("musicrid") or "").replace("MUSIC_", "").strip()
+            if not rid:
+                continue
+            out.append({
+                "rid": rid,
+                "title": _html.unescape(str(t.get("name") or t.get("song_name") or "")),
+                "artist": _html.unescape(str(t.get("artist") or "")),
+                "album": _html.unescape(str(t.get("album") or "")),
+                "duration_s": t.get("duration") or 0,
+                "cover_url": str(t.get("pic") or ""),
+            })
+        if len(ml) < rn:
+            break
+        pn += 1
+    return out[:want]
+
+
+def _kuwo_is_bang(source_id: str) -> bool:
+    """判断酷我 id 是否属于榜单（bangMenu 内的 36 榜）。"""
+    sid = str(source_id or "").strip()
+    if not sid:
+        return False
+    for b in _kuwo_bang_menu():
+        if str(b.get("id")) == sid:
+            return True
+    return False
+
+
+def _kuwo_playlist_tracks(pid: str, want: int = 60) -> list:
+    """酷我「用户歌单」（搜索结果）曲目。
+
+    ★ 端点：`/api/www/playlist/playListInfo?pid=<id>&pn=1&rn=30`（大写 L；小写 `playlistInfo` 是 404）。
+    ★ 同榜单接口一样，`rn` 上限 30 ⇒ 固定 30 + `pn` 翻页。
+    返回 [{rid,title,artist,album,duration_s,cover_url}]。
+    """
+    import urllib.parse as _up
+    out = []
+    pn = 1
+    while len(out) < want and pn <= 4:
+        url = KUWO_PLAYLIST_INFO_URL + "?" + _up.urlencode({"pid": pid, "pn": pn, "rn": 30})
+        status, payload, _ = _kuwo_http(url, timeout=12)
+        if status != 200 or not isinstance(payload, dict):
+            break
+        ml = ((payload.get("data") or {}).get("musicList") or [])
+        if not isinstance(ml, list) or not ml:
+            break
+        for t in ml:
+            if not isinstance(t, dict):
+                continue
+            rid = str(t.get("rid") or t.get("musicrid") or "").replace("MUSIC_", "").strip()
+            if not rid:
+                continue
+            out.append({
+                "rid": rid,
+                "title": _html.unescape(str(t.get("name") or "")),
+                "artist": _html.unescape(str(t.get("artist") or "")),
+                "album": _html.unescape(str(t.get("album") or "")),
+                "duration_s": t.get("duration") or 0,
+                "cover_url": str(t.get("pic") or t.get("albumpic") or ""),
+            })
+        if len(ml) < 30:
+            break
+        pn += 1
+    return out[:want]
+
+
+def _kuwo_search_playlists(keyword: str, limit: int = 20) -> list:
+    """酷我歌单搜索：`searchPlayListBykeyWord?key=<kw>&pn=1&rn=<n>`。
+
+    返回 [{id,name,creator,tracks,cover}]；data.list 项字段：id/name/uname/total/img/listencnt。
+    """
+    import urllib.parse as _up
+    kw = str(keyword or "").strip()
+    if not kw:
+        return []
+    url = KUWO_SEARCH_PLAYLIST_URL + "?" + _up.urlencode(
+        {"key": kw, "pn": 1, "rn": max(1, min(int(limit or 20), 30))})
+    status, payload, _ = _kuwo_http(url, timeout=12)
+    if status != 200 or not isinstance(payload, dict):
+        return []
+    arr = ((payload.get("data") or {}).get("list") or [])
+    out = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        pid = str(it.get("id") or "").strip()
+        # ★ 含 HTML 实体（&nbsp; / &amp; 等），需解码
+        nm = _html.unescape(str(it.get("name") or "").strip())
+        if not pid or not nm:
+            continue
+        try:
+            total = int(str(it.get("total") or "0"))
+        except (TypeError, ValueError):
+            total = 0
+        out.append({"id": pid, "name": nm,
+                    "creator": _html.unescape(str(it.get("uname") or "").strip()),
+                    "tracks": total, "cover": str(it.get("img") or "")})
+    return out
+
+
+def _netease_search_playlists(keyword: str, limit: int = 20) -> list:
+    """网易云歌单搜索：`GET {musicbox}/api/v1/search?keyword=<kw>&type=playlist&limit=<n>`。
+
+    ★ `type` 必须传 `playlist`（传 1000 会 400）。
+    返回 [{id,name,creator,tracks,cover}]；data 项字段：playlist_id/playlist_name/creator_name。
+    """
+    import urllib.parse as _up
+    kw = str(keyword or "").strip()
+    if not kw:
+        return []
+    qs = _up.urlencode({"keyword": kw, "type": "playlist", "limit": max(1, min(int(limit or 20), 30))})
+    status, payload, _ = _mb_http("GET", "/api/v1/search?" + qs, timeout=25)
+    if status != 200 or not isinstance(payload, dict):
+        return []
+    arr = payload.get("data") or []
+    out = []
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        pid = str(it.get("playlist_id") or "").strip()
+        nm = str(it.get("playlist_name") or "").strip()
+        if not pid or not nm:
+            continue
+        out.append({"id": pid, "name": nm, "creator": str(it.get("creator_name") or ""),
+                    "tracks": 0, "cover": ""})
+    return out
+
+
+def _admin_playlists_search(keyword: str, limit: int = 20, kind: str = "playlist") -> dict:
+    """综合搜索（v77）：kind=playlist 搜音乐歌单，kind=novel 搜喜马拉雅小说。
+
+    返回 {code, q, kind, results:[{source, source_name, id, name, creator, tracks, cover}]}
+    只搜已启用的音源。
+
+    ★ kind=novel 时**只**走喜马拉雅：用户选了「小说」就是要找有声书，
+      混进网易云/酷我的歌单反而干扰。kind=playlist 时也不带喜马拉雅 ——
+      小说结果混在音乐歌单里没法直接加进「当前歌单」以外的用途，且名字形态完全不同。
+    """
+    kw = str(keyword or "").strip()
+    kind = str(kind or "playlist").strip().lower()
+    if kind not in ("playlist", "novel"):
+        kind = "playlist"
+    if not kw:
+        return {"code": 0, "q": "", "kind": kind, "results": []}
+    results = []
+    if kind == "novel":
+        if not CONF.get("xmly_enabled", True):
+            return {"code": 0, "q": kw, "kind": kind, "results": [],
+                    "msg": "喜马拉雅音源已停用。"}
+        try:
+            # ★ 管理台是同步的 socketserver 线程，这里用同步 HTTP 通道，
+            #   不要 asyncio.run —— 在带/不带运行循环的线程里行为不一致。
+            from urllib.parse import urlencode as _xmly_urlencode
+            _q = _xmly_urlencode({"keyword": kw, "limit": max(1, min(int(limit), 30))})
+            _st, _payload, _raw = _xmly_http("GET", "/api/v1/search?" + _q, timeout=25)
+            for a in ((_payload or {}).get("albums") or []):
+                aid = str(a.get("albumId") or "").strip()
+                if not aid:
+                    continue
+                results.append({
+                    "source": "xmly", "source_name": "喜马拉雅",
+                    "id": aid,
+                    "name": str(a.get("title") or "喜马拉雅专辑"),
+                    "creator": str(a.get("author") or ""),
+                    "tracks": int(a.get("trackCount") or 0),
+                    "cover": _xmly_abs_cover(str(a.get("cover") or "")),
+                    "category": str(a.get("category") or ""),
+                    "intro": str(a.get("intro") or ""),
+                })
+        except Exception as e:  # noqa: BLE001
+            logger.warning("xmly novel search failed: %s", e)
+        return {"code": 0, "q": kw, "kind": kind, "results": results}
+
+    if CONF.get("netease_enabled", True):
+        try:
+            for it in _netease_search_playlists(kw, limit):
+                it.update({"source": "netease", "source_name": "网易云音乐"})
+                results.append(it)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("netease playlist search failed: %s", e)
+    # 酷我是否在用：与 _admin_playlists_payload 保持一致（看 online_sources 里有没有 kuwo）
+    if "kuwo" in str(CONF.get("online_sources") or "").lower():
+        try:
+            for it in _kuwo_search_playlists(kw, limit):
+                it.update({"source": "kuwo", "source_name": "酷我音乐"})
+                results.append(it)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("kuwo playlist search failed: %s", e)
+    return {"code": 0, "q": kw, "kind": kind, "results": results}
+
+
+def _admin_playlists_payload() -> dict:
+    ne_on = bool(CONF.get("netease_enabled", True))
+    lx_on = bool(CONF.get("lx_enabled", True))
+    md_on = bool(CONF.get("musicdl_enabled", True))
+    kuwo_on = ("kuwo" in str(CONF.get("online_sources") or "").lower())
+    migu_on = ("migu" in str(CONF.get("online_sources") or "").lower())
+    llm_on = dailyrec.llm_enabled()
+    daily_enabled = ne_on or lx_on
+    daily_mode = "llm-fallback" if (llm_on and not ne_on) else "source-native"
+    # 已载入歌单 = 插件内置注入（每日推荐）+ 用户加入的「当前歌单」
+    # v71：心动·华语流行歌单已按用户要求下线 —— 不再内置注入、不再出现在「已载入歌单」。
+    current = [
+        {"id": "daily", "builtin": True, "source": "netease", "source_id": "", "name": "每日推荐",
+         "enabled": daily_enabled, "track_count": 0, "env": None,
+         "desc": "每日生成推荐歌单；模式：%s；LLM 兜底：%s。" % (daily_mode, "开" if llm_on else "关"),
+         "mode": daily_mode, "llm": ("enabled" if llm_on else "disabled")},
+    ]
+    # 自愈：历史记录若 track_count 为 0（旧版本未在加入时计算），这里补算一次并落盘，
+    # 避免「已加入但显示 0 首」让人误以为歌单是空的。
+    try:
+        _pls = _load_user_playlists()
+        _healed = False
+        for _p in _pls:
+            if int(_p.get("track_count") or 0) <= 0:
+                _tc = _user_playlist_track_count(_p.get("source"), _p.get("source_id"))
+                if _tc > 0:
+                    _p["track_count"] = _tc
+                    _healed = True
+        if _healed:
+            _save_user_playlists(_pls)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("user playlist track_count self-heal failed: %s", e)
+    for p in _load_user_playlists():
+        current.append({
+            "id": p["id"], "builtin": False, "source": p["source"], "source_id": p["source_id"],
+            "name": p["name"], "enabled": p["enabled"],
+            "track_count": int(p.get("track_count") or 0), "env": None,
+            "desc": "来自 %s 的歌单（已加入）。" % p["source"],
+        })
+    # 按已保存的整体顺序（layout，含内置 id）排列；未记录的新项排在末尾
+    lay = _load_layout()
+    if lay:
+        pos = {k: i for i, k in enumerate(lay)}
+        current.sort(key=lambda x: pos.get(str(x.get("id")), 10 ** 6))
+    sources = []
+    ne_pl = _musicbox_toplist() if ne_on else []
+    sources.append({"key": "netease", "name": "网易云音乐", "enabled": ne_on, "playlists": ne_pl})
+    kw_pl = _kuwo_bang_menu() if kuwo_on else []
+    sources.append({"key": "kuwo", "name": "酷我音乐", "enabled": kuwo_on, "playlists": kw_pl,
+                    "note": "" if kw_pl else "酷我榜单接口暂不可用（可检查网络后点刷新重试）。"})
+    # ★ 只保留真正有可浏览歌单的音源：网易云（榜单）/ 酷我（榜单）。
+    #   咪咕、洛雪(LX)、音乐猫(MusicDL) 均无歌单列表接口，已从歌单页移除（用户要求）。
+    # v71：AI 歌单预设已按用户要求下线 —— 歌单页不再出现「AI 歌单」分组。
+    # （_build_ai_tracks 等实现保留，便于历史上已加入的 ai 歌单仍可解析。）
+    ai = []
+    return {"code": 0, "current": current, "sources": sources, "ai": ai}
+
+
+def _admin_playlists_post(body: dict) -> dict:
+    action = (body.get("action") or "").strip().lower()
+    try:
+        pls = _load_user_playlists()
+    except Exception:
+        pls = []
+    if action == "generate":
+        # 参数组合式生成（仅预览，不写入）；UI 确认后再用 add(source=custom) 加入
+        return _admin_playlists_generate(body)
+    if action == "add":
+        source = str(body.get("source") or "netease").strip().lower()
+        source_id = str(body.get("source_id") or "").strip()
+        name = str(body.get("name") or "").strip() or "未命名歌单"
+        # v77：搜索结果里带海报的（尤其喜马拉雅小说）把封面一起存下来，
+        #      这样「我的歌单」列表不必等 /static/cover 现抓就能预热出海报。
+        cover = str(body.get("cover") or "").strip()
+        if not source_id:
+            return {"code": 1, "msg": "source_id required"}
+        # 去重：同一源+源歌单 ID 不重复加入
+        for p in pls:
+            if p["source"] == source and p["source_id"] == source_id:
+                return {"code": 1, "msg": "该歌单已在当前歌单中"}
+        import uuid
+        pid = uuid.uuid4().hex[:12]
+        # 加入时解析曲目数并落盘（避免 UI 显示 0 首让人以为歌单是空的）。
+        # ★ 网易「非榜单」歌单取曲走 `/api/v1/playlist/{id}`，实测 15~60s —— 不能让「加入」按钮
+        #   卡住几十秒，故这类走后台线程补算，先以 0 落盘（列表自愈 + 15 分钟缓存兜底）。
+        # AI 预设需要跨多个榜单组装（数秒），同样走后台补算，别让「加入」按钮卡住。
+        slow = bool(source == "ai") or bool(
+            source == "netease" and _netease_toplist_for(source_id).get("index") is None) or bool(
+            # 生成器歌单：刚生成过会命中磁盘缓存（瞬间）；未生成过则后台补算
+            source == CUSTOM_SOURCE and not _ai_load_cache("gen_" + source_id))
+        tc = 0 if slow else _user_playlist_track_count(source, source_id)
+        pls.append({"id": pid, "source": source, "source_id": source_id, "name": name,
+                    "enabled": True, "order": len(pls), "track_count": tc, "cover": cover})
+        _save_user_playlists(pls)
+        if slow:
+            def _bg_count():
+                try:
+                    n = _user_playlist_track_count(source, source_id)
+                    if n > 0:
+                        arr = _load_user_playlists()
+                        for it in arr:
+                            if it.get("id") == pid:
+                                it["track_count"] = n
+                        _save_user_playlists(arr)
+                        logger.info("user playlist %s track_count backfilled: %d", pid, n)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("user playlist %s track_count backfill failed: %s", pid, e)
+            import threading
+            threading.Thread(target=_bg_count, name="pl-count", daemon=True).start()
+        return {"code": 0, "msg": "added", "id": pid, "track_count": tc, "pending": bool(slow),
+                "current": _admin_playlists_payload()["current"]}
+    if action == "remove":
+        pid = str(body.get("id") or "").strip()
+        if not pid:
+            return {"code": 1, "msg": "id required"}
+        pls = [p for p in pls if p["id"] != pid]
+        _save_user_playlists(pls)
+        # v72b：歌单都删了，bundle 缓存必须一起清掉，
+        # 否则后面再加入同 id 歌单会读到这个已删歌单的旧曲目。
+        _invalidate_user_bundle(pid)
+        return {"code": 0, "msg": "removed", "current": _admin_playlists_payload()["current"]}
+    if action == "refresh":
+        # v72b：手动清除 bundle 缓存。清掉后下一次打开该歌单会重新从源站拉取
+        # （非榜单歌单可能要十几秒），之后重新进入 10min/2h 缓存。
+        pid = str(body.get("id") or "").strip()
+        if not pid:
+            return {"code": 1, "msg": "id required"}
+        _invalidate_user_bundle(pid)
+        return {"code": 0, "msg": "已清除缓存，下次打开该歌单会重新拉取",
+                "current": _admin_playlists_payload()["current"]}
+    if action == "toggle":
+        pid = str(body.get("id") or "").strip()
+        enabled = bool(body.get("enabled"))
+        found = False
+        for p in pls:
+            if p["id"] == pid:
+                p["enabled"] = enabled
+                found = True
+                break
+        if not found:
+            return {"code": 1, "msg": "not found"}
+        _save_user_playlists(pls)
+        return {"code": 0, "msg": "toggled", "current": _admin_playlists_payload()["current"]}
+    if action == "reorder":
+        raw = body.get("ids") or []
+        if isinstance(raw, str):
+            ids = [s.strip() for s in raw.split(",") if s.strip()]
+        else:
+            ids = [str(x).strip() for x in raw if str(x).strip()]
+        if not ids:
+            return {"code": 1, "msg": "ids required"}
+        # 整体顺序（含内置 id：daily / xd）一并持久化
+        _save_layout(ids)
+        by_id = {p["id"]: p for p in pls}
+        new_order = [by_id[i] for i in ids if i in by_id]
+        # 追加未在 ids 中的（防御性）
+        for p in pls:
+            if p["id"] not in ids:
+                new_order.append(p)
+        _save_user_playlists(new_order)
+        return {"code": 0, "msg": "reordered", "current": _admin_playlists_payload()["current"]}
+    return {"code": 1, "msg": "unknown action"}
+
+
+class _AdminHTTPHandler(_AdminBaseHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "fnmusic-ext-admin"
+
+    def _qs(self) -> dict:
+        return {k: v[0] for k, v in _aparse_qs(_aurlparse(self.path).query).items()}
+
+    def _send(self, status, body: bytes, ctype: str):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+        self.send_header("Access-Control-Allow-Methods", "GET, PUT, POST, OPTIONS")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> bytes:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            n = 0
+        return self.rfile.read(n) if n > 0 else b""
+
+    def do_OPTIONS(self):
+        self._send(204, b"", "text/plain; charset=utf-8")
+
+    def do_GET(self):
+        path = _aurlparse(self.path).path
+        if path in ("/", "/admin"):
+            self._send(200, _load_admin_ui_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/healthz":
+            self._send(200, _ajson.dumps(_healthz_payload(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/config":
+            if not _admin_auth_ok(self.headers, self._qs()):
+                self._send(401, _ajson.dumps({"code": 401, "msg": "unauthorized"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            payload = {"code": 0, "schema": ADMIN_GROUPS, "values": _current_values(),
+                       "needs_restart": _ADMIN_PENDING_RESTART, "auth": bool(_admin_token()),
+                       "restart_required_keys": [it["env"] for it in SCHEMA_INDEX.values() if it.get("restart")]}
+            self._send(200, _ajson.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/sources":
+            self._send(200, _ajson.dumps(_admin_sources_payload(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/playlists":
+            self._send(200, _ajson.dumps(_admin_playlists_payload(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/playlists/dims":
+            self._send(200, _ajson.dumps(_admin_playlists_dims(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/playlists/search":
+            q = (self._qs().get("q") or self._qs().get("keyword") or "").strip()
+            try:
+                limit = int(self._qs().get("limit") or 20)
+            except (TypeError, ValueError):
+                limit = 20
+            # v77：kind=playlist 搜音乐歌单，kind=novel 搜喜马拉雅小说
+            kind = (self._qs().get("kind") or self._qs().get("type") or "playlist").strip().lower()
+            try:
+                payload = _admin_playlists_search(q, limit, kind)
+            except Exception as e:  # noqa: BLE001
+                payload = {"code": 1, "msg": str(e), "q": q, "kind": kind, "results": []}
+            self._send(200, _ajson.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/netease/status":
+            self._send(200, _ajson.dumps(_admin_netease_status(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/netease/qr/check":
+            unikey = (self._qs().get("unikey") or "").strip()
+            if not unikey:
+                self._send(400, _ajson.dumps({"code": 400, "msg": "unikey required"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            self._send(200, _ajson.dumps(_admin_netease_check(unikey), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        # === v76 喜马拉雅扫码登录 ===
+        if path == "/admin/api/xmly/status":
+            self._send(200, _ajson.dumps(_admin_xmly_status(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/xmly/qr":
+            _status, payload, raw = _xmly_http("GET", "/api/v1/auth/qrcode", timeout=20)
+            self._send(200, _ajson.dumps(payload if isinstance(payload, dict)
+                                         else {"ok": False, "msg": (raw or "")[:200]},
+                                         ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/xmly/qr/check":
+            from urllib.parse import quote as _xq
+            qr_id = (self._qs().get("qrId") or "").strip()
+            if not qr_id:
+                self._send(400, _ajson.dumps({"ok": False, "msg": "qrId required"},
+                                             ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            _s, payload, raw = _xmly_http(
+                "GET", "/api/v1/auth/poll?qrId=" + _xq(str(qr_id)), timeout=25)
+            if isinstance(payload, dict) and payload.get("status") == "success":
+                st = _admin_xmly_status()
+                payload.update({"logged_in": st.get("logged_in"),
+                                "nickname": st.get("nickname"),
+                                "is_vip": st.get("is_vip")})
+            self._send(200, _ajson.dumps(payload if isinstance(payload, dict)
+                                         else {"ok": False, "status": "unknown",
+                                               "msg": (raw or "")[:200]},
+                                         ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_PUT(self):
+        path = _aurlparse(self.path).path
+        if path == "/admin/api/config":
+            if not _admin_auth_ok(self.headers, self._qs()):
+                self._send(401, _ajson.dumps({"code": 401, "msg": "unauthorized"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            raw = self._read_body()
+            try:
+                data = _ajson.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            changes = data.get("changes") if isinstance(data, dict) else None
+            if not isinstance(changes, dict) or not changes:
+                self._send(400, _ajson.dumps({"code": 1, "msg": "no changes"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            err, _ = _admin_apply_changes_sync(changes)
+            if err is not None:
+                self._send(400, _ajson.dumps(err, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            payload = {"code": 0, "msg": "ok", "values": _current_values(),
+                       "needs_restart": _ADMIN_PENDING_RESTART}
+            self._send(200, _ajson.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def do_POST(self):
+        path = _aurlparse(self.path).path
+        if path == "/admin/api/restart":
+            if not _admin_auth_ok(self.headers, self._qs()):
+                self._send(401, _ajson.dumps({"code": 401, "msg": "unauthorized"}, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
+                return
+            ok = _admin_do_restart_sync()
+            self._send(200 if ok else 500,
+                       _ajson.dumps({"code": 0 if ok else 1, "msg": "restarting" if ok else "restart failed"},
+                                    ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/xmly/logout":
+            self._send(200, _ajson.dumps(_xmly_http("POST", "/api/v1/auth/logout", timeout=10)[1] or {"ok": False},
+                                         ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/netease/qr":
+            self._send(200, _ajson.dumps(_admin_netease_qr(), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        if path == "/admin/api/playlists":
+            raw = self._read_body()
+            try:
+                data = _ajson.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            self._send(200, _ajson.dumps(_admin_playlists_post(data), ensure_ascii=False).encode("utf-8"),
+                       "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def log_message(self, *args):  # 静默默认访问日志
+        return
+
+
+def _run_admin_tcp_server() -> None:
+    port = int(CONF.get("admin_port") or 8799)
+    try:
+        srv = _AdminHTTPServer(("0.0.0.0", port), _AdminHTTPHandler)
+        logger.info("管理控制台独立端口已启动: http://0.0.0.0:%s", port)
+        srv.serve_forever()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("管理控制台独立端口 :%s 启动失败: %s", port, e)
+
+
+_ADMIN_TCP_STARTED = False
+
+
+def _admin_tcp_startup() -> None:
+    global _ADMIN_TCP_STARTED
+    if _ADMIN_TCP_STARTED:
+        return
+    _ADMIN_TCP_STARTED = True
+    import threading
+    threading.Thread(target=_run_admin_tcp_server, name="admin-tcp", daemon=True).start()
+
+
+# 模块导入即拉起独立端口（不依赖 FastAPI lifespan/on_event，兼容 takeover 自定义 lifespan）。
+_admin_tcp_startup()
+
+
 @app.get("/music/api/v1/playlist/list")
 @app.get("/music/api/v1/playlist/list/{subpath:path}")
 async def playlist_list(request: Request):
@@ -5420,28 +8889,80 @@ async def playlist_list(request: Request):
         data["list"] = official
     rec = _playlist_public_fields(bundle.get("playlist") or {})
     rec["trackCount"] = len(bundle.get("tracks") or [])
+
+    # v71：心动·华语流行歌单已下线，不再注入歌单列表。
+    xd_rec = None
+
+    # 用户管理歌单（当前歌单）：仅注入启用项；按 id 建表以便按整体顺序注入
+    user_recs = []
+    recs_by_id: dict = {"daily": rec}
+    try:
+        for up in _load_user_playlists():
+            if not up.get("enabled"):
+                continue
+            ur = _user_public_fields(up, up.get("track_count") or 0)
+            user_recs.append(ur)
+            recs_by_id[str(up.get("id"))] = ur
+    except Exception as e:
+        logger.warning("user playlist list inject failed: %s", e)
+    if xd_rec:  # v71 后恒为 None，保留结构以兼容历史 layout
+        recs_by_id["xd"] = xd_rec
+
     official = [
         it for it in official
-        if not (isinstance(it, dict) and dailyrec.is_daily_playlist_guid(str(it.get("guid") or "")))
+        if not (isinstance(it, dict) and (
+            dailyrec.is_daily_playlist_guid(str(it.get("guid") or ""))
+            or is_xd_playlist_guid(str(it.get("guid") or ""))
+            or is_user_playlist_guid(str(it.get("guid") or ""))
+        ))
     ]
-    data["list"] = [rec] + official
+    # 按管理台保存的整体顺序（layout）注入；未记录的项排在其后
+    lay = _load_layout()
+    head = [recs_by_id[k] for k in lay if k in recs_by_id]
+    for _k, _v in recs_by_id.items():
+        if _k not in lay:
+            head.append(_v)
+    data["list"] = head + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + 1
+    data["total"] = (total if isinstance(total, int) else len(official)) + len(head)
+    # v72：列表已经秒回了，顺手后台预热还没缓存的用户歌单，
+    # 用户点进详情/曲目列表时即可命中缓存（否则要等 15~60s）。
+    try:
+        for _up in _load_user_playlists()[:8]:
+            _uid = str(_up.get("id") or "")
+            if not _up.get("enabled") or not _uid:
+                continue
+            if _peek_user_bundle(_uid) is None and _uid not in _USER_BUNDLE_REFRESHING:
+                _USER_BUNDLE_REFRESHING.add(_uid)
+                _spawn_bg_task(_refresh_user_bundle_bg(request.app, _uid))
+    except Exception as e:
+        logger.warning("user bundle warmup failed: %s", e)
     return JSONResponse(content=envelope, headers=headers)
 
 
 @app.get("/music/api/v1/playlist/detail")
 async def playlist_detail(request: Request):
     guid = str(request.query_params.get("guid") or "").strip()
-    if not dailyrec.is_daily_playlist_guid(guid):
+    if is_xmly_playlist_guid(guid):
+        # v76 喜马拉雅歌单（一部小说 = 一个专辑）
+        rec = await _xmly_album_to_playlist_record(_xmly_album_id_from_guid(guid))
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
+    if not (dailyrec.is_daily_playlist_guid(guid) or is_xd_playlist_guid(guid) or is_user_playlist_guid(guid)):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
+    if is_user_playlist_guid(guid):
+        bundle = await _load_user_bundle(request, _user_playlist_id_from_guid(guid))
+        rec = _user_public_fields(bundle.get("playlist") or {}, len(bundle.get("tracks") or []))
+    elif is_xd_playlist_guid(guid):
+        bundle = await _load_xd_bundle(request)
+        rec = _xd_public_fields(bundle.get("playlist") or {})
+    else:
+        bundle = await _load_daily_bundle(request, user_guid)
+        rec = _playlist_public_fields(bundle.get("playlist") or {})
     rec["trackCount"] = len(bundle.get("tracks") or [])
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
 
@@ -5451,11 +8972,15 @@ async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     daily_ids = [g for g in guids if dailyrec.is_daily_playlist_guid(g)]
-    if not daily_ids:
+    xd_ids = [g for g in guids if is_xd_playlist_guid(g)]
+    user_ids = [g for g in guids if is_user_playlist_guid(g)]
+    xmly_ids = [g for g in guids if is_xmly_playlist_guid(g)]
+    local_ids = daily_ids + xd_ids + user_ids + xmly_ids
+    if not local_ids:
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
-    rest = [g for g in guids if not dailyrec.is_daily_playlist_guid(g)]
+    rest = [g for g in guids if g not in local_ids]
     official_list: list = []
     if rest:
         headers = copy_incoming_headers(request)
@@ -5480,10 +9005,82 @@ async def playlist_batch_detail(request: Request):
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
-    rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
-    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": [rec] + official_list}})
+    local_recs: list = []
+    if xmly_ids:
+        # v76 喜马拉雅：并发组装，避免 N 个歌单串行等待
+        got = await asyncio.gather(*[_xmly_album_to_playlist_record(_xmly_album_id_from_guid(g))
+                                     for g in xmly_ids], return_exceptions=True)
+        for b in got:
+            if isinstance(b, dict):
+                local_recs.append(b)
+    if daily_ids:
+        bundle = await _load_daily_bundle(request, user_guid)
+        rec = _playlist_public_fields(bundle.get("playlist") or {})
+        rec["trackCount"] = len(bundle.get("tracks") or [])
+        local_recs.append(rec)
+    if xd_ids:
+        bundle = await _load_xd_bundle(request)
+        rec = _xd_public_fields(bundle.get("playlist") or {})
+        rec["trackCount"] = len(bundle.get("tracks") or [])
+        local_recs.append(rec)
+    if user_ids:
+        # v72：并发 + 优先用缓存秒开。
+        # 旧实现是「串行 for 循环」逐个 await ⇒ N 个歌单 = N 次 musicbox 慢查询（实测 3 个 4.4s/30.6s）。
+        async def _one(ug: str):
+            uid = _user_playlist_id_from_guid(ug)
+            b = _peek_user_bundle(uid)
+            if b is not None:
+                return b
+            # 缓存未命中：别让用户干等 15~60s —— 用落盘的 track_count 先出占位，后台慢慢建
+            if uid not in _USER_BUNDLE_REFRESHING:
+                _USER_BUNDLE_REFRESHING.add(uid)
+                _spawn_bg_task(_refresh_user_bundle_bg(request.app, uid))
+            return None
+
+        got = await asyncio.gather(*[_one(ug) for ug in user_ids], return_exceptions=True)
+        for ug, b in zip(user_ids, got):
+            uid = _user_playlist_id_from_guid(ug)
+            try:
+                if isinstance(b, BaseException):
+                    raise b
+                if b is not None:
+                    local_recs.append(_user_public_fields(
+                        b.get("playlist") or {}, len(b.get("tracks") or [])))
+                    continue
+                _meta = next((p for p in _load_user_playlists() if p["id"] == uid), None)
+                if _meta:
+                    local_recs.append(_user_public_fields(
+                        _user_playlist_record([], "", _meta.get("name") or "未命名歌单",
+                                              USER_GUID_PREFIX + uid),
+                        int(_meta.get("track_count") or 0)))
+            except Exception as e:
+                logger.warning("user playlist batch-detail %s failed: %s", ug, e)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": local_recs + official_list}})
+
+
+# 歌单曲目分页：客户端（手机 App / 网页）打开歌单时传的是 `page=1&size=-1`，
+# `-1` 的语义是「不分页，一次给全」。以前 `if size < 1: size = 50` 把它兜成 50
+# ⇒ 上千集的小说只显示前 50 集（v78 修）。
+_PAGE_ALL_CAP = 5000
+
+
+def _page_size(request) -> int:
+    """返回分页大小；`<=0`（含 App 的 -1）表示「一次给全」。"""
+    raw = request.query_params.get("size")
+    if raw is None or raw == "":
+        return 50
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 50
+
+
+def _slice_page(items: list, page: int, size: int) -> list:
+    """按 page/size 切片；size <= 0 时返回整张（受 _PAGE_ALL_CAP 保护）。"""
+    if size <= 0:
+        return list(items or [])[:_PAGE_ALL_CAP] if page <= 1 else []
+    start = (page - 1) * size
+    return list(items or [])[start:start + size]
 
 
 @app.get("/music/api/v1/track/playlist-detail/list")
@@ -5494,27 +9091,65 @@ async def playlist_track_list(request: Request):
         or request.query_params.get("guid")
         or ""
     ).strip()
-    if not dailyrec.is_daily_playlist_guid(guid):
+    if is_xmly_playlist_guid(guid):
+        # v76 喜马拉雅歌单：整张专辑（可能上千集）一次性给全，支持 page/size 分页
+        all_tracks = await _xmly_playlist_tracks(_xmly_album_id_from_guid(guid))
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        # ★ v78：App（手机/网页）打开歌单点进来用的是 `page=1&size=-1`，
+        #   `-1` 的语义是「不分页，一次给全」。旧代码先 `if size < 1: size = 50`
+        #   把它兜成了 50，后面那句 `if size != -1` 因此**永远不成立**（死代码）
+        #   ⇒ 上千集的小说只给前 50 集，用户以为「歌单不完整」。
+        #   ⇒ size <= 0 一律按「全部」处理，另留安全上限防止异常歌单打爆内存/带宽。
+        size = _page_size(request)
+        page_tracks = _slice_page(all_tracks, page, size)
+        try:
+            _prefetch_online_covers(page_tracks)
+        except Exception:  # noqa: BLE001
+            pass
+        return JSONResponse(content={"code": 0, "msg": "ok",
+                                     "data": {"list": page_tracks, "total": len(all_tracks),
+                                              "sort": request.query_params.get("sort") or ""}})
+    if not (dailyrec.is_daily_playlist_guid(guid) or is_xd_playlist_guid(guid) or is_user_playlist_guid(guid)):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
-    bundle = await _load_daily_bundle(request, user_guid)
+    if is_user_playlist_guid(guid):
+        user_id = _user_playlist_id_from_guid(guid)
+        bundle = await _load_user_bundle(request, user_id)
+        # 缓存真实曲目数到持久化记录，供列表展示（非致命）
+        try:
+            _n = len(bundle.get("tracks") or [])
+            _ups = _load_user_playlists()
+            _changed = False
+            for _u in _ups:
+                if _u["id"] == user_id:
+                    if int(_u.get("track_count") or 0) != _n:
+                        _u["track_count"] = _n
+                        _changed = True
+                    break
+            # v72：只在真的变了才写盘 —— 旧实现每次打开歌单都全量重写一次 JSON
+            if _changed:
+                _save_user_playlists(_ups)
+        except Exception:
+            pass
+    elif is_xd_playlist_guid(guid):
+        bundle = await _load_xd_bundle(request)
+    else:
+        bundle = await _load_daily_bundle(request, user_guid)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
         page = 1
-    try:
-        size = int(request.query_params.get("size") or 50)
-    except (TypeError, ValueError):
-        size = 50
-    if size < 1:
-        size = 50
-    start = (page - 1) * size
-    page_tracks = tracks[start:start + size] if size != -1 else tracks
+    # 同上：size=-1 表示「一次给全」，不能兜成 50
+    size = _page_size(request)
+    page_tracks = _slice_page(tracks, page, size)
     _prefetch_online_covers(page_tracks)
     _spawn_bg(_prefetch_online_meta(request, page_tracks))
     _spawn_bg(_prefetch_stream_urls(request, page_tracks))

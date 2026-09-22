@@ -3,94 +3,53 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
-## [1.6.0+patch3] - 2026-09-18
+## [1.7.0] - 2026-09-22
+
+本分支（[`Sanmmz/fnos_music_ext`](https://github.com/Sanmmz/fnos_music_ext)）在
+上游 v1.6.0 基线上的增强版本。详细对照见 [`DIFFERENCES.md`](DIFFERENCES.md)，
+逐版补丁说明见 [`v76-变更说明.md`](v76-变更说明.md)、
+[`v77-变更说明.md`](v77-变更说明.md)、[`v78-变更说明.md`](v78-变更说明.md)。
 
 ### 新增
 
-- **搜索结果「有海报 + 高音质」优先排序**：搜索在线歌曲时，按 `(-有海报, -音质档, 原始顺序)`
-  稳定重排，把「带封面且高码率/无损」的条目顶到第一屏前端。
-  - **补全层** `_enrich_search_items()`：网易云**一次批量详情**
-    （`POST music.163.com/api/v3/song/detail`，1 次请求 / 25 首 / 0.171s，拿到 `al.picUrl` 封面
-    + `sq/hr/h/m/l` 真实音质档）+ 酷我单曲详情
-    （`wapi.kuwo.cn/api/www/music/musicInfo?mid=`，0.11s/首，`Semaphore(6)` 并发），只补第一屏前 30 条；
-  - **排序层** `rank_search_items()`：稳定排序，音质档取「扩展名推导」与「补全结果」**较大者**，
-    避免「显示 AAC 却排到 mp3 后面」；
-  - **首屏四层保证**：聚合内边收边排 + 首屏多等 `search_rank_wait_s`（1.5s）+ 分页按 guid 去重分配
-    + 已发布页重排后对齐（`_resync_published_pages`），确保排序一定作用在第一屏；
-  - **确定性**：「有海报」判据只认条目 / `meta_cache` 里的封面 URL，**不看磁盘预热进度**，
-    同一关键词重复搜索顺序一致；搜索页接入与每日推荐同款的封面后台预取 `_prefetch_online_covers()`。
-
-### 新增配置
-
-- `FNMUSIC_SEARCH_RANK`（默认 `cover_quality`；可选 `quality_cover` / `off`）
-- `FNMUSIC_SEARCH_ENRICH`（默认 `true`）、`FNMUSIC_SEARCH_ENRICH_LIMIT`（默认 `30`）、
-  `FNMUSIC_SEARCH_ENRICH_WAIT_S`（默认 `1.5`）、`FNMUSIC_SEARCH_RANK_WAIT_S`（默认 `1.5`）
-
-### 验收
-
-- 沙箱单元 **188 / 188 PASS**（`patches/_v55_check.py`）；真机端到端 **4 / 4 轮全绿**
-  （搜索 周杰伦 / 稻香 / 空心，首屏有海报占比 21~30/30、top10 恒为「有封面 + 无损」、顺序稳定）。
-- 详见 [`reports/fnmusic-v55-报告.md`](reports/fnmusic-v55-报告.md)。
-
-## [1.6.0+patch2] - 2026-09-18
+- **喜马拉雅（有声书）音源 `xmly`（v76）**：
+  - 新增独立服务 `xmly-service/`（容器端口 `8774`，宿主 `127.0.0.1:8774`），
+    已加入 `docker-compose.yml`；
+  - 模型：**一个歌单 = 一部小说 = 喜马拉雅的一个专辑**。
+    歌单 guid `online:playlist:xmly:<albumId>`，单集 guid `online:xmly:<trackId>:<albumId>`；
+  - 触发词劫持：搜索框输入 `小说 吞噬星空` / `喜马拉雅 …` / `xmly …`（大小写均可）
+    才调用喜马拉雅，不带触发词时完全走原有音乐链路，互不干扰；
+  - 播放地址走 `/mobile-playpage/track/v3/baseInfo` + **AES-128-ECB 解密**得到真实 m4a 直链；
+  - **管理页扫码登录**：左侧「音源」→ 🎙️ 喜马拉雅 → 扫码登录（base64 PNG，2 秒轮询
+    `pending → scanned → success/expired`）；登录 cookie 落 `xmly-data/`，用于 VIP / 付费专辑播放。
+    按设计**暂不同步**订阅、收藏与收听历史；
+  - 新增配置：`FNMUSIC_XMLY_ENABLED`、`FNMUSIC_XMLY_URL`。
+- **Web 管理后台「综合搜索」（v77）**：
+  - 分组标题由「歌单综合搜索」改为「**综合搜索**」，搜索栏**左侧**新增「**歌单 / 小说**」分段控件；
+  - `kind=playlist`（默认，向后兼容）：网易云 + 酷我；`kind=novel`：**只查喜马拉雅**，
+    返回集数 / 分类 / 简介 / 封面，可直接加入「当前歌单」；
+  - 移动端自适应：整条搜索栏允许换行，控件与输入框 `min-height:44px`、字号 16px（防 iOS 自动缩放）。
+- **docker-compose 部署方式**：README 新增完整章节——compose 只跑 4 个音源服务，
+  核心代理（必须接管 Unix Socket）仍由宿主机 systemd 运行；含 `ensure_base_image.sh`
+  镜像源探测、端口与数据卷对照表、日常运维命令。
 
 ### 修复
 
-- **收藏后歌词不贴身（patch1 的回归，严重）**：「收藏前播过一次」的在线曲目，
-  其歌词已存在 `cache/<guid>.lrc`；收藏整轨下载把音频落进曲库后，
-  歌词仍被写回 `cache/`，**曲库音频旁边永远没有同名 `.lrc`**。
-  根因是 `lyric_cache_path()` 把「已有歌词优先」放在了「音频已在曲库」之前，
-  而 `find_lyric_file()` 会命中 `cache/` 里的旧副本 ⇒ 落点被劫持。
-  现将「音频已在曲库」提到最前（**歌词跟着音频走**），并收紧 `write_lyric_cache()`
-  的短路条件（从「任意位置内容一致」改为「目标位置内容一致」），
-  同时清掉 cache 里的影子副本。
-
-### 新增
-
-- **歌词「贴身」自愈**：`promote_one_lyric()` / `promote_library_lyrics()` 把
-  「音频已在曲库、歌词却留在 `cache/`」的**存量**歌词补成曲库同名 sidecar；
-  启动后 12 秒补一次 + 周期复扫 + 每次整轨下载落盘后补位；
-  歌词读取路径也做幂等纠正。开关 `FNMUSIC_LYRIC_PROMOTE`（默认开）。
-
-## [1.6.0+patch] - 2026-09-18
-
-> 增强分支。在上游 v1.6.0 基础上叠加，**改动仅涉及 `proxy/app.py`**。
-> 详细说明见 [PATCHES.md](PATCHES.md)，验收报告见 [`reports/`](reports/)。
-
-### 修复
-
-- **手机 App 收藏/最近播放整列空白（严重）**：在线条目入库时标题为空、时长为 0、封面 URL 无效
-  → 废弃 `stub_online_info`，改为多后端补齐元数据，**解析不出标题的在线曲目一律不入库**；
-  同时修正时长（洛雪把酷狗「秒」当毫秒）与封面尺寸归一化（126.net 原图 7MB → `?param=300y300` 102KB）。
-- **列表整列渲染超时（严重）**：在线封面是**现抓**的，约 4 秒/张 × N 条
-  → 封面按 guid **落盘缓存** + 列表返回时后台预取 + 抓图共享长连接，实测 4000ms → **0~2ms**。
-- **封面接口不再 404 / 不再返回 JSON**：四级兜底（`_online_info` → `meta_cache` → 网易云详情 → 占位 PNG），
-  任何情况都返回 200 + 真实图片字节；尺寸按客户端 `size` 分档。
-- **每日推荐 20 首有 15 首点播放 404（严重）**：取流走 musicbox 耗时 1.2~94 秒，被 4 秒硬超时打断
-  → 新增网易云**直连取流快通道** + musicbox 原样兜底 + 取流地址缓存/预热，可播 **5/20 → 20/20**，
-  单首首字节 **4000ms → ~800ms**。（`freeTrialInfo` 非空判失败，避免 VIP 曲目只放 30 秒试听片段。）
-- **播放历史「移除在线曲目」被参数校验拒绝**：修复 `play-history/delete` 端点。
-- **「边听边存」时有时无**：真实播放器按 1MB 定长窗口取流，旧逻辑只认 `bytes=0-`
-  → 改为**服务端独立整轨下载**，不依赖 Range 形态与断开时序。
-- **陈旧 `.ref` 把文件写回已不存在的旧曲库**（`FileNotFoundError`）：复用旧映射前校验同目录，
-  并给改名加 `shutil.move` 兜底（跨文件系统 `rename` 会抛 EXDEV）。
-
-### 新增
-
-- **自动扫库**：曲库迁到 rclone 云盘挂载点后 FUSE 不产生 inotify 事件，飞牛自动扫描彻底失效
-  → 落盘/删除成功后**借 App 凭证主动调飞牛扫描接口**（3s 合并窗口 + 下次带鉴权请求兜底消化）。
-  实测下载后 **9 秒**被扫到并入库，删除后被标记 `is_physical_file_deleted=1`。
-- **收藏即下载（可开关）**：只对收藏的在线曲目落盘，取消收藏即删除对应音频 / `.lrc` / `.ref`。
-- **孤儿歌词自愈**：歌词落地归属重定（云盘曲库不再产出无主歌词）+ 歌词专用映射 `.lyricref`
-  + 定时清扫存量孤儿（带最小年龄、目录白名单、同名词曲检查等安全边界）。
-
-### 变更
-
-- `_online_info` 增加 TTL 缓存（默认 300s）与并发去重，缓存键含凭据与音源配置；
-  三后端元数据解析改为并发。
-- `detect_library_dir()` 增加 30s 缓存（此前每个 `/stream` 都开一次 SQLite 并对云盘挂载做 stat）。
-- 修掉两个真 bug：`_prefetch_online_meta` 因裸调用协程而**从未执行**；
-  `asyncio.create_task()` 不留引用时任务可能被 GC（新增 `_BG_TASKS` 强引用池）。
+- **小说歌单打开后只有 49/50 集（v78，严重）**：客户端（手机 App / 网页）打开歌单时
+  发的是 `page=1&size=-1`，`-1` 的语义是「不分页，一次给全」。旧代码先执行
+  `if size < 1: size = 50`，导致后面的 `if size != -1` 成为**永不进入的死分支**，
+  上千集的小说永远只吐前 50 集。改为新增 `_page_size()` / `_slice_page()`：
+  `size <= 0` 视为「一次给全」并用 `_PAGE_ALL_CAP = 5000` 兜底，
+  `page > 1` 且 `size <= 0` 返回空；`size` 缺失/非数字仍为 50，与旧行为一致。
+  实测 313 集专辑 `size=-1` 现在返回 **313 / 313**（2.3 s，535 KB）。
+- **小说搜索结果没有海报封面（v77）**：v76 把 `coverId` 直接填成了外链图片地址，
+  `/static/cover` 解析不出音源 ⇒ 歌单卡片海报整块空白。
+  改为 `coverId = 歌单 guid`（`online:playlist:xmly:<albumId>`），
+  并在 `/static/cover` 的 `_online_info` **之前**插入 xmly 分支（缓存 → 抓图 → 兜底档位 → 占位 PNG）。
+  > ★ 铁律：`coverId` 必须是 `/static/cover` 能解析的 **guid**，绝不能填外链 URL。
+- **喜马拉雅海报体积过大（v77b）**：`_sized_cover_url()` 新增 `xmcdn.com` 分支，
+  利用图床 `!op_type=3&columns=N&rows=N` 现算缩略图：原图 686 KB → `size=600` 47 KB → `size=300` 15 KB。
+  （注意：不能加 `magick=png`，600 档会膨胀到 492 KB；URL 已有 `!...` 必须先剥掉再拼。）
 
 ## [1.6.0] - 2026-09-17
 

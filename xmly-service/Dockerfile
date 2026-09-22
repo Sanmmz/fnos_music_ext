@@ -14,24 +14,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN useradd -m -u 1000 appuser \
-    && mkdir -p /data /data/cache/netease-musicbox /data/config/netease-musicbox /data/netease-musicbox \
-    && chown -R appuser:appuser /data \
+RUN mkdir -p /data \
     && chmod -R 777 /data
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# v75d: 网易云旧搜索端点 /weapi/search/get 已返回空 result，改用 cloudsearch
-RUN python -c "import glob;p=glob.glob('/usr/local/lib/python*/site-packages/NEMbox/api.py')[0];s=open(p,encoding='utf-8').read();assert '/weapi/search/get' in s;open(p,'w',encoding='utf-8').write(s.replace('/weapi/search/get','/weapi/cloudsearch/pc'))"
-
-# --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
-COPY --chown=appuser:appuser app.py /app/app.py
-COPY --chown=appuser:appuser runner.py /app/runner.py
-COPY --chown=appuser:appuser netease_ext.py /app/netease_ext.py
+COPY app.py /app/app.py
 RUN chmod 0644 /app/*.py
 
-USER appuser
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=8s --retries=3 \

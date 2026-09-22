@@ -1,0 +1,5 @@
+# 喜马拉雅音源服务
+fastapi>=0.110
+uvicorn>=0.29
+httpx>=0.27
+cryptography>=42.0
