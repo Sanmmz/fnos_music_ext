@@ -100,3 +100,74 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # =============================================================================
+  # 核心代理（接管 /var/run/trim_music.socket，零侵入扩展飞牛音乐）
+  #
+  # 容器化约束（fail-closed 安全机制要求）：
+  #   * network_mode: host  —— 容器内 127.0.0.1 直达宿主机音源端口；管理台
+  #                          TCP 8799 直接绑定宿主机，局域网可访问。
+  #   * pid: host          —— takeover.py 用 SO_PEERCRED + /proc/<pid>/exe 校验
+  #                          官方监听身份；共享宿主 PID 命名空间后校验逻辑不变。
+  #   * /var/run:/var/run:rw —— renameat2 才能在宿主机 socket 路径上原子移动。
+  #   * stop_grace_period  —— 给 supervise() 的 finally（复原官方 socket）留足时间。
+  #   * 数据目录 bind 挂载  —— FNMUSIC_HOME=/app，故 cache/online_favorites/
+  #                          play_history/recommend_cache 落在 /app 下，挂载宿主
+  #                          既有目录以保留历史数据与收藏；官方 music.db 只读挂载。
+  #
+  # 部署模式由宿主 .env 的 FNMUSIC_PROXY_MODE 控制（host=systemd 回退，docker=容器）。
+  # 一键拉起全部：docker compose up -d（含本服务与上面 4 个音源服务）。
+  # =============================================================================
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: fnmusic-proxy
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    stop_grace_period: 60s
+    volumes:
+      # 接管宿主机飞牛音乐 Unix socket（必须 rw）
+      - /var/run:/var/run:rw
+      # 接管状态（ownership.json 等），与 entrypoint --state-dir 一致，持久化
+      - ./.runtime:/app/.runtime
+      # 配置（可读写）：environment() 读取 /app/.env 注入环境变量；
+      # 去掉 :ro 以便代理 Settings→Save 可回写 .env（否则 os.replace 跨文件系统 + 只读均失败）。
+      - ./.env:/app/.env
+      # 业务数据目录（FNMUSIC_HOME=/app 解析到此），挂载宿主既有目录保留数据
+      - ./cache:/app/cache
+      - ./online_favorites:/app/online_favorites
+      - ./play_history:/app/play_history
+      - ./recommend_cache:/app/recommend_cache
+      # 网易云取流快通道：直连解析要读 musicbox 的登录 cookie（含 MUSIC_U）。
+      # 旧配置没把 musicbox-data 挂进代理 => _netease_cookie_header() 恒为 None
+      # => 每首歌都回落到慢速 musicbox 兜底（实测 1.4~17s）=> 撞取流启动超时 404。
+      - ./musicbox-data:/app/musicbox-data:ro
+      # 官方音乐库（只读）：FNMUSIC_MUSIC_DB 默认值
+      - /usr/local/apps/@appdata/trim.music/db/music.db:/usr/local/apps/@appdata/trim.music/db/music.db:ro
+      # 曲库所在存储池（可写）：「收藏即下载 / 播放即下载 / 边听边存」的音频要落到飞牛共享曲库。
+      # ★ 必须挂：不挂的话容器内 /vol02 只是个空目录（容器层），文件写完宿主机曲库里根本看不到，
+      #   容器一重建还全丢 —— 表现就是「设置里开了下载，却一首都没下载」。
+      #   若你的曲库在别的存储池（/vol01、/vol03…），照样子加一行即可。
+      - /vol02:/vol02:ro
+      # 下载落盘目录（可写）：「收藏即下载 / 播放即下载 / 边听边存」的音频写到这里，
+      # 对应 .env 的 FNMUSIC_TEE_SAVE_DIR=/app/downloads。
+      # ★ 为什么不用曲库那个云盘目录：飞牛曲库常挂在 rclone（fuse）云盘上，
+      #   容器里**看得到却写不进去**（文件能建、内容 0 字节 / ENODATA，放行 /dev/fuse + SYS_ADMIN 也无效）。
+      #   所以统一落本地盘，再由飞牛把该目录加进音乐库即可。
+      - ./downloads:/app/downloads:rw
+    depends_on:
+      musicdl:
+        condition: service_healthy
+      musicbox:
+        condition: service_healthy
+      lxmusic:
+        condition: service_healthy
+    healthcheck:
+      # 复用 takeover.py ready：校验 target 为已记录的代理且 /_ext/healthz ok
+      test: ["CMD", "/app/.venv-proxy/bin/python", "/app/proxy/takeover.py", "ready", "--state-dir", "/app/.runtime", "--timeout", "10"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s

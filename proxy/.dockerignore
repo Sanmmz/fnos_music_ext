@@ -1,0 +1,12 @@
+# 构建代理镜像时排除宿主机/开发产物，避免污染镜像或拖慢构建
+.venv-proxy
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+tests
+.pytest_cache
+.git
+.gitignore
+*.md

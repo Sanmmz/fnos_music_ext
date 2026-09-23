@@ -146,24 +146,6 @@
   .pl-ai-cat-hd .cnm{font-weight:700;font-size:14px}
   .pl-ai-cat-hd .cdesc{font-size:11px;color:var(--muted)}
   .pl-ai-cat+.pl-ai-cat{margin-top:14px;padding-top:12px;border-top:1px dashed var(--border)}
-  /* 歌单生成器：参数 chips + 预览 */
-  .gen-dim{margin-bottom:14px}
-  .gen-dim-hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px}
-  .gen-dim-hd .dnm{font-weight:700;font-size:13px}
-  .gen-dim-hd .dhint{font-size:11px;color:var(--muted)}
-  .gen-chips{display:flex;flex-wrap:wrap;gap:7px}
-  .chip{padding:7px 13px;border-radius:999px;border:1px solid var(--border);background:var(--panel);
-    font-size:13px;cursor:pointer;color:var(--text);transition:.15s;user-select:none}
-  .chip:hover{border-color:var(--brand)}
-  .chip.on{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
-  .gen-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
-  .gen-preview{margin-top:12px;border:1px solid var(--border);border-radius:12px;padding:12px 14px;background:var(--panel2)}
-  .gen-preview .gpn{font-weight:700;font-size:14px;margin-bottom:4px}
-  .gen-preview .gpmeta{font-size:11px;color:var(--muted);margin-bottom:8px}
-  .gen-sample{display:flex;flex-direction:column;gap:4px;margin:8px 0}
-  .gen-sample .gs{font-size:12px;color:var(--muted);display:flex;gap:8px;align-items:baseline}
-  .gen-sample .gs b{color:var(--text);font-weight:600}
-  .gen-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
   .pl-manage-row,.pl-src-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;
     background:var(--panel2);border:1px solid var(--border)}
   .pl-manage-row .mmove{display:flex;flex-direction:column;gap:2px;flex:0 0 22px}
@@ -385,7 +367,6 @@ const SORTABLE_KEYS = SOURCES.filter(s=>s.sortable).map(s=>s.key);
 
 let STATE = { view:"source", sources:null, playlists:null, order:null, selected:null, qr:null, poll:null, plSel:null, plFilter:"", plSearch:{q:"", kind:"playlist", results:null, loading:false, msg:""},
   xmlyQr:null,
-  gen:{ dims:null, sizes:[20,30,40,60], region:[], mood:[], language:"any", size:40, result:null, loading:false, msg:"" },
   settings:null, storage:null };
 
 document.getElementById("tokenOk").onclick = ()=>{
@@ -408,8 +389,6 @@ async function loadAll(){
   }catch(e){ STATE.sources = {code:1,error:String(e)}; }
   if(STATE.view==="playlist"){
     try{ const rp=await api("/admin/api/playlists"); STATE.playlists = await rp.json(); }catch(e){ STATE.playlists={code:1,error:String(e)}; }
-    if(!STATE.gen.dims){ try{ const rd=await api("/admin/api/playlists/dims"); const d=await rd.json();
-      if(d && d.code===0){ STATE.gen.dims=d.dims||[]; STATE.gen.sizes=d.sizes||[20,30,40,60]; STATE.gen.size=d.default_size||40; } }catch(e){} }
   }
   if(STATE.view==="settings"){
     try{ const rs=await api("/admin/api/config"); const ds=await rs.json();
@@ -551,10 +530,13 @@ function srcDesc(k){
 /* ===== v76 喜马拉雅扫码登录 ===== */
 function renderXmlyDetail(){
   const x = STATE.sources.xmly || {}; const logged = x.logged_in; let body;
-  if(logged){
+  // v86 修复：同网易云——已登录时点「重新扫码登录」取到码也渲染不出来（二维码块
+  // 原本挂在 `else if` 上，被前面的 `if(logged)` 挡住）。改为优先渲染二维码块。
+  if(STATE.xmlyQr){ body = renderXmlyQRBlock(); }
+  else if(logged){
     body = `<div class="ne-info"><div class="ne-status-line"><span class="dot ok"></span>喜马拉雅账号 <b>${esc(x.nickname||"已登录")}</b> 已连接${x.is_vip?"（VIP 权益可用）":"（未识别到 VIP，付费专辑可能只能试听）"}</div>
       <div class="actions"><button class="btn" onclick="startXmlyQR()">重新扫码登录</button><button class="btn" onclick="xmlyLogout()">退出登录</button><button class="btn" onclick="loadAll()">刷新状态</button></div></div>`;
-  } else if(STATE.xmlyQr){ body = renderXmlyQRBlock(); }
+  }
   else { body = `<div class="ne-info"><div class="ne-status-line"><span class="dot warn"></span>喜马拉雅 <b>未登录</b>，付费/VIP 专辑只能试听。</div>
     <div class="actions"><button class="btn primary" onclick="startXmlyQR()">扫码登录</button></div></div>`; }
   return `<div class="panel">
@@ -617,10 +599,15 @@ async function xmlyLogout(){
 }
 function renderNeteaseDetail(){
   const ne = STATE.sources.netease; const logged = ne.logged_in; let body;
-  if(logged){
+  // v86 修复：已登录状态下点「重新扫码登录」时二维码不显示。
+  // 原逻辑把二维码块挂在 `else if(STATE.qr)` 上，而它前面的 `if(logged)` 在已登录时
+  // 永远先命中，导致「重新扫码登录」按钮（只在已登录时出现）取到码也渲染不出来。
+  // 改为：只要已取到二维码就优先渲染二维码块。
+  if(STATE.qr){ body = renderQRBlock(); }
+  else if(logged){
     body = `<div class="ne-info"><div class="ne-status-line"><span class="dot ${ne.cookie_ok?"ok":"warn"}"></span>网易云账号 <b>${esc(ne.nickname||"已登录")}</b> 已连接${ne.cookie_ok?"，取流凭证有效":"，但取流凭证无效"}</div>
       <div class="actions"><button class="btn" onclick="startQR()">重新扫码登录</button><button class="btn" onclick="loadAll()">刷新状态</button></div></div>`;
-  } else if(STATE.qr){ body = renderQRBlock(); }
+  }
   else { body = `<div class="ne-info"><div class="ne-status-line"><span class="dot bad"></span>网易云 <b>未登录</b>，部分取流能力不可用。</div>
     <div class="actions"><button class="btn primary" onclick="startQR()">扫码登录</button></div></div>`; }
   const backend = STATE.sources.musicbox;
@@ -874,8 +861,6 @@ function renderPlaylists(){
   const curCount = (p.current||[]).length;
   // v77：「歌单综合搜索」改名「综合搜索」——除歌单外还能搜喜马拉雅小说
   groups.push({key:"search", em:"🔍", label:"综合搜索", sub:"歌单 / 小说", sel: STATE.plSel==="search"});
-  // v73：用户要求「歌单生成排在歌单搜索下方」—— 生成器紧跟搜索，排在当前歌单之前
-  groups.push({key:"gen", em:"🎛️", label:"歌单生成器", sub:"自定义组合", sel: STATE.plSel==="gen"});
   groups.push({key:"current", em:"📂", label:"当前歌单", sub: curCount+" 个已载入", sel: STATE.plSel==="current"});
   // v71：AI 歌单分组已下线
   (p.sources||[]).forEach(s=>{
@@ -910,8 +895,8 @@ function renderPlGroup(){
   const p = STATE.playlists, sel = STATE.plSel;
   if(sel==="search") return renderSearchGroup();
   if(sel==="current") return renderCurrentGroup();
-  if(sel==="ai"){ STATE.plSel="gen"; return renderGenGroup(); }  // v71: AI 歌单已下线
-  if(sel==="gen") return renderGenGroup();
+  // 已移除的分组（AI 歌单预设、自定义参数组合）：残留选中态一律回落到「综合搜索」
+  if(sel==="ai" || sel==="gen"){ STATE.plSel="search"; return renderSearchGroup(); }
   if(typeof sel==="string" && sel.indexOf("src:")===0){
     const key = sel.slice(4);
     const s = (p.sources||[]).find(x=>x.key===key);
@@ -958,7 +943,7 @@ function renderSearchResults(st){
     ? "结果来自喜马拉雅的公开专辑（一部小说 = 一个专辑）。"
     : "结果来自网易云音乐与酷我音乐的公开歌单。"}</div>`;
   if(!st.results.length) return `<div class="empty">没有找到与「${esc(st.q)}」相关的${what}。</div>`;
-  return st.results.map(r=>{
+  const rows = st.results.map(r=>{
     const added = isAdded(r.source, String(r.id));
     const cnt = r.tracks ? (isNovel ? (r.tracks + " 集") : (r.tracks + " 首")) : "";
     const sub = [
@@ -975,11 +960,18 @@ function renderSearchResults(st){
         onclick="addToCur('${r.source}','${esc(String(r.id))}','${esc(r.name)}','${esc(String(r.cover||""))}')">${added?"已加入":"加入当前歌单"}</button></div>
     </div>`;
   }).join("");
+  /* v80：音源搜索失败不再静默 —— 旧实现把网易云的超时/异常直接吞掉，
+     界面只显示酷我，用户以为网易云没结果。这里把失败明确告之。 */
+  const ws = st.warnings || [];
+  const warn = ws.length
+    ? `<div class="empty" style="color:#c98a2a;text-align:left">⚠️ ${ws.map(w=>esc(w)).join("；")}。可再点一次「搜索」重试。</div>`
+    : "";
+  return rows + warn;
 }
 /* 切换「歌单 / 小说」：只改选择器高亮 + 输入框占位符 + 结果区，
    不整页重渲染 —— 否则输入框会失焦、已输入的关键字也保不住。 */
 function setPlKind(kind){
-  const st = STATE.plSearch; st.kind = kind; st.results = null; st.msg = "";
+  const st = STATE.plSearch; st.kind = kind; st.results = null; st.msg = ""; st.warnings = [];
   document.querySelectorAll(".pl-kind button").forEach(b=>{
     b.classList.toggle("on", b.textContent.trim() === (PL_KINDS.find(x=>x.key===kind)||{}).label);
   });
@@ -1001,14 +993,15 @@ async function doPlSearch(){
   st.q = el ? el.value.trim() : "";
   const isNovel = (st.kind||"playlist") === "novel";
   const what = isNovel ? "小说" : "歌单";
-  if(!st.q){ st.results=null; st.msg=""; paintSearch(); return; }
-  st.loading = true; st.msg = ""; paintSearch();
+  if(!st.q){ st.results=null; st.msg=""; st.warnings=[]; paintSearch(); return; }
+  st.loading = true; st.msg = ""; st.warnings = []; paintSearch();
   try{
     const r = await api("/admin/api/playlists/search?q=" + encodeURIComponent(st.q)
       + "&limit=20&kind=" + encodeURIComponent(st.kind||"playlist"));
     const d = await r.json();
     if(d && d.code === 0){
       st.results = d.results || [];
+      st.warnings = d.warnings || [];
       st.msg = st.results.length ? "" : `没有找到与「${st.q}」相关的${what}。`;
     }else{
       st.results = null; st.msg = (d && d.msg) || "搜索失败";
@@ -1022,105 +1015,6 @@ function paintSearch(){
   if(box) box.innerHTML = renderSearchResults(STATE.plSearch);
   const btn = document.querySelector(".pl-search-bar .btn");
   if(btn) btn.textContent = STATE.plSearch.loading ? "搜索中…" : "搜索";
-}
-
-/* ============ 歌单生成器（自定义参数组合） ============ */
-function genDim(key){
-  return (STATE.gen.dims||[]).find(d=>d.key===key) || null;
-}
-function renderGenGroup(){
-  const g = STATE.gen;
-  if(!g.dims) return `<div class="panel">
-    <div class="ph"><div class="ttl"><span class="em">🎛️</span><span>歌单生成器</span></div></div>
-    <div class="empty">正在加载可选项… <button class="btn" onclick="loadAll()">重试</button></div></div>`;
-  const dimBlocks = ["region","mood","language"].map(k=>{
-    const d = genDim(k); if(!d) return "";
-    const multi = !!d.multi;
-    const chips = (d.options||[]).map(o=>{
-      const on = multi ? (g[k]||[]).indexOf(o.key)>=0 : g[k]===o.key;
-      return `<span class="chip${on?" on":""}" onclick="toggleGenOpt('${k}','${esc(o.key)}',${multi})">${esc(o.name)}</span>`;
-    }).join("");
-    const hint = multi ? "可多选，不选=不限" : "单选";
-    return `<div class="gen-dim">
-      <div class="gen-dim-hd"><span class="dnm">${esc(d.name)}</span><span class="dhint">${hint}</span></div>
-      <div class="gen-chips">${chips}</div>
-    </div>`;
-  }).join("");
-  const sizeChips = (g.sizes||[]).map(s=>
-    `<span class="chip${String(g.size)===String(s)?" on":""}" onclick="setGenSize(${s})">${s} 首</span>`).join("");
-  return `<div class="panel">
-    <div class="ph"><div class="ttl"><span class="em">🎛️</span><span>歌单生成器</span></div>${badge("ok","自定义组合")}</div>
-    <div class="desc">按<b>地区 / 心情 / 语言</b>自由组合；后台按维度分配席位、榜内加权抽样，
-      <b>优先采用网易云音源</b>（不足时才用酷我补齐）并跨榜去重。同样的条件结果稳定，换条件即换一批歌。
-      生成后可预览曲目，再决定是否加入「当前歌单」。</div>
-    ${dimBlocks}
-    <div class="gen-dim">
-      <div class="gen-dim-hd"><span class="dnm">规模</span><span class="dhint">单张歌单曲目数</span></div>
-      <div class="gen-chips">${sizeChips}</div>
-    </div>
-    <div class="gen-foot">
-      <button class="btn primary" onclick="doGenerate()">${g.loading?"生成中…":"生成歌单"}</button>
-      <button class="btn" onclick="resetGen()">重置条件</button>
-      ${g.msg?`<span class="dhint">${esc(g.msg)}</span>`:""}
-    </div>
-    <div id="genPreview">${renderGenPreview()}</div>
-  </div>`;
-}
-function renderGenPreview(){
-  const g = STATE.gen, r = g.result;
-  if(g.loading) return `<div class="gen-preview"><div class="gpn">正在生成…</div>
-    <div class="gpmeta">正在从各平台榜单筛选并组装，通常需要数秒。</div></div>`;
-  if(!r) return `<div class="gen-preview"><div class="gpn">尚未生成</div>
-    <div class="gpmeta">选择上方条件后点击「生成歌单」，这里会显示结果预览。</div></div>`;
-  if(r.code!==0) return `<div class="gen-preview"><div class="gpn">生成失败</div>
-    <div class="gpmeta">${esc(r.msg||"未知错误")}</div></div>`;
-  const added = isAdded("custom", String(r.key));
-  const sample = (r.sample||[]).map(s=>
-    `<div class="gs">· <b>${esc(s.title||"未知")}</b><span>${esc(s.artist||"")}</span></div>`).join("");
-  return `<div class="gen-preview">
-    <div class="gpn">${esc(r.name||"自定义歌单")}</div>
-    <div class="gpmeta">共 ${r.track_count||0} 首 · 取自 ${r.charts||0} 个真实榜单${r.netease_first?" · 网易优先":""}</div>
-    ${r.low_yield?`<div class="gpmeta" style="color:#b26a00">⚠ 当前条件只取到 ${r.track_count||0} 首（目标 ${r.requested_size||40} 首）。可放宽地区 / 心情，或把语言改为「不限」后再生成。</div>`:""}
-    ${sample?`<div class="gen-sample">${sample}</div>`:""}
-    <div class="gen-actions">
-      <button class="btn primary" ${added?"disabled":""}
-        onclick="addToCur('custom','${esc(String(r.key))}','${esc(r.name||"自定义歌单")}')">${added?"已加入当前歌单":"加入当前歌单"}</button>
-      <button class="btn" onclick="doGenerate()">重新生成</button>
-    </div>
-  </div>`;
-}
-function toggleGenOpt(dim, key, multi){
-  const g = STATE.gen;
-  if(multi){
-    const arr = (g[dim]||[]).slice();
-    const i = arr.indexOf(key);
-    if(i>=0) arr.splice(i,1); else arr.push(key);
-    g[dim] = arr;
-  }else{
-    g[dim] = key;
-  }
-  g.result = null; g.msg = "";
-  renderPlaylists();
-}
-function setGenSize(s){ STATE.gen.size = s; STATE.gen.result=null; STATE.gen.msg=""; renderPlaylists(); }
-function resetGen(){
-  STATE.gen.region=[]; STATE.gen.mood=[]; STATE.gen.language="any";
-  STATE.gen.size=40; STATE.gen.result=null; STATE.gen.msg="";
-  renderPlaylists();
-}
-async function doGenerate(){
-  const g = STATE.gen;
-  g.loading = true; g.msg = ""; g.result = null; renderPlaylists();
-  try{
-    const r = await api("/admin/api/playlists", {method:"POST", body: JSON.stringify({
-      action:"generate", region:g.region, mood:g.mood, language:g.language, size:g.size })});
-    if(r.status===401){ showLogin(); g.loading=false; renderPlaylists(); return; }
-    const d = await r.json();
-    g.result = d;
-    if(d && d.code!==0) g.msg = d.msg || "生成失败";
-  }catch(e){ g.result = {code:1, msg:String(e)}; }
-  g.loading = false;
-  renderPlaylists();
 }
 
 function renderCurrentGroup(){

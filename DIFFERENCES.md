@@ -222,10 +222,11 @@
 
 ## 兼容性与安装
 
-- **安装方式与上游完全一致**：`install.sh` / `extend.sh` / `restore.sh` 等一个字节都没改；
-  `docker-compose.yml` 只**追加**了 `xmly` 一个 service 块，其余未动。
-- **也可以用 docker-compose 部署**：compose 负责 4 个音源服务，核心代理（需接管 Unix Socket）
-  仍由宿主机 systemd 运行。完整步骤见 README 的「方式二：docker-compose 部署」。
+- **安装方式与上游高度一致**：`install.sh` / `extend.sh` / `restore.sh` 沿用上游结构并扩展了
+  `FNMUSIC_PROXY_MODE`（host / docker）分支；`docker-compose.yml` 在追加 `xmly` service 的基础上，
+  v1.8.4 新增 `proxy` service 实现核心代理容器化（fail-closed 安全机制不变）。
+- **也可以用 docker-compose 部署**：compose 负责 4 个音源服务 + 可选的核心代理容器（`FNMUSIC_PROXY_MODE=docker`）；
+  默认核心代理仍由宿主机 systemd 接管 Socket，作为一键回退。完整步骤见 README 的「方式二：docker-compose 部署」。
 - **新增的 23 个配置项全部有默认值**，`.env` 不填也能跑；想用「只对收藏落盘」「自动扫库」「搜索结果排序」按 `PATCHES.md` 里的清单打开即可。
 - **回滚很简单**：换回上游的 `proxy/app.py` 并重启服务即可（本分支未改数据结构）。
 - 本分支自带 4 份验收报告（[`reports/`](reports/)）与可复现脚本（[`patches/`](patches/)），

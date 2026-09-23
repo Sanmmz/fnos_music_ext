@@ -1,6 +1,8 @@
-# 人工安装与部署指南
+# 部署与运维指南（docker-compose）
 
 适用环境：飞牛 NAS（fnOS）已安装并启动「飞牛音乐」官方应用。本项目采用无侵入接管设计，**完全不修改**飞牛官方 nginx 配置、不 Patch 官方 Go 二进制、不改动官方数据库。
+
+> 🚀 **部署只有一种方式：docker-compose。** 一键脚本（install.sh / extend.sh / restore.sh）仅作为上游遗留的应急回退保留，正常部署不需要执行。
 
 > 💡 **自动化部署提示**：若使用 AI Agent（如 OpenCode、Claude Code、Cursor 等）进行全流程自动化部署与自检验收，请直接查阅 [Agent 安装提示词](AGENT_INSTALL.md)。
 
@@ -19,150 +21,70 @@
 
 克隆项目并进入根目录赋予执行权限：
 ```bash
-git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
+git clone https://github.com/Sanmmz/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
-chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
+chmod +x ensure_base_image.sh
 ```
 
 ---
 
-## 1. 安装模式透明说明（消除黑盒困惑）
+## 1. 部署形态：只有 docker-compose 一种
 
-为了让用户完全掌控系统的变动，下文对扩展代理的两种部署模式进行彻底、透明的直白说明：
+> ⚠️ **本仓库只使用 docker-compose 部署。** 音源与核心代理全部由
+> `docker compose up -d --build` 拉起，不再需要 `install.sh` / `extend.sh`，
+> 也不再使用宿主机 systemd（host 模式仅作为应急回退保留）。
+> 完整步骤以 [README](../README.md#部署步骤) 为准，本文补充运维细节。
 
-### 共通的核心运行原则（必读）
-> ⚠️ **无论选择「Docker 容器模式」还是「Host 宿主机本地服务模式」，核心代理服务（`fnmusic-ext`）都必须以宿主机 systemd 运行！**
-> 
-> **原因**：核心代理的核心任务是零侵入接管宿主机上的 Unix Domain Socket（`/var/run/trim_music.socket`），使官方 nginx 与飞牛原生后端透明桥接。若将代理塞入普通 Docker bridge 容器，将面临复杂的跨容器与宿主机 socket 权限穿透问题，因此核心代理始终由宿主机 systemd（`fnmusic-ext.service`，运行在独立的 `.venv-proxy` 虚拟环境中）原生管理。
-> 
-> **结论**：两种安装模式的**唯一区别**，仅在于**「音乐源服务（musicdl / musicbox / lxmusic）」以何种方式运行与隔离**。
+```bash
+cd fnmusic_ext              # 你的部署目录，例如 ~/docker/music
 
----
+cp .env.example .env && chmod 600 .env
+./ensure_base_image.sh      # 探测可用的 Docker 基础镜像（国内网络建议先跑）
+sudo docker compose up -d --build
+```
 
-### 方式 A：Docker 容器模式（推荐）
+拉起后会得到 5 个容器：
 
-适合绝大多数已在 fnOS「应用中心」启用 Docker 的用户，享有最干净的环境隔离与省心的更新体验。
-
-- **前置条件**：
-  * 必须先在 fnOS「应用中心」安装好 Docker。**脚本不会擅自安装 Docker 引擎**；若未安装，向导会友好提醒并引导切换至 Host 模式。
-- **会部署什么**：
-  * 通过 `docker-compose.yml` 在本地构建并启动按需启用的音源容器：
-    1. **`fnmusic-musicdl`**：监听 **`127.0.0.1:8768`**（酷我/咪咕聚合）；
-    2. **`fnmusic-musicbox`**：监听 **`0.0.0.0:8770`**（网易云；局域网扫码登录）；
-    3. **`fnmusic-lxmusic`**：监听 **`127.0.0.1:8772`**（洛雪风格免登录解析：酷狗/网易/咪咕）；
-- **容器网络与权限**：
-  * 容器内运行无特权（以非 root 的普通用户运行）；
-  * 数据卷严格挂载并隔离在当前项目目录下的 `musicbox-data/` 目录中，不与系统其他目录发生交叉。
-
----
-
-### 方式 B：Host 宿主机本地服务模式（纯净无 Docker）
-
-适合未安装 Docker、不希望引入容器虚拟化，或追求极致轻量与低资源占用的机器。
-
-- **适用场景**：
-  * 未装 Docker 或 NAS 内存/CPU 资源极为宝贵的环境。
-- **会部署什么**：
-  * **独立的 Python 虚拟环境**：在当前项目目录下分别创建 `.venv-musicdl`、`.venv-musicbox`、`.venv-lxmusic` 与 `.venv-proxy`。依赖严格限制在各自虚拟环境内，**绝不污染系统全局 Python 环境**；
-  * **注册轻量 systemd 服务**：
-    1. `fnmusic-musicdl.service`：`127.0.0.1:8768`；
-    2. `fnmusic-musicbox.service`：`0.0.0.0:8770`（局域网扫码）；
-    3. `fnmusic-lxmusic.service`：`127.0.0.1:8772`；
-- **数据与缓存管理**：
-  * 所有运行时数据（音频缓存 `cache/`、用户收藏 `online_favorites/`、历史记录 `play_history/`、网易云配置与缓存 `musicbox-data/`）严格保存在当前项目根目录下，**绝对不会散落到系统其他地方**。
-
----
-
-### 双模式透明对照表
-
-| 对比维度 | 方式 A：Docker 容器模式（推荐） | 方式 B：Host 宿主机本地服务模式（纯净无 Docker） |
+| 容器 | 端口 | 作用 |
 | :--- | :--- | :--- |
-| **推荐指数** | ⭐⭐⭐⭐⭐（环境隔离最彻底） | ⭐⭐⭐⭐（免 Docker、极致轻量） |
-| **适用群体** | 已安装 Docker，注重系统纯净度与隔离性 | 未装 Docker、低内存小主机、或追求直接运行 |
-| **前置要求** | fnOS 应用中心安装 Docker（**脚本不擅自安装**） | 仅需宿主机具备 `python3` 及 `python3-venv` |
-| **核心代理部署** | 宿主机 systemd 服务（`.venv-proxy` 独立虚拟环境） | 宿主机 systemd 服务（`.venv-proxy` 独立虚拟环境） |
-| **音源运行形态** | Docker 容器（通过 `docker-compose` 编排管理） | 宿主机 systemd 服务（通过独立 Python venv 隔离） |
-| **部署组件与端口** | • `fnmusic-musicdl`：`127.0.0.1:8768`<br>• `fnmusic-musicbox`：`0.0.0.0:8770`（局域网可扫码）<br>• `fnmusic-lxmusic`：`127.0.0.1:8772` | • `fnmusic-musicdl.service`：`127.0.0.1:8768`<br>• `fnmusic-musicbox.service`：`0.0.0.0:8770`<br>• `fnmusic-lxmusic.service`：`127.0.0.1:8772` |
-| **Python 环境隔离** | 依赖封装在容器镜像内，宿主机零依赖污染 | 项目目录下 `.venv-musicdl` / `.venv-musicbox`，不污染全局 |
-| **权限与安全性** | 容器内无特权用户运行，隔离网络端口 | 独立 systemd 进程，仅监听本地回环网络 |
-| **数据落盘路径** | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` | 项目根目录 `cache/`、`online_favorites/`、`musicbox-data/` |
-| **常规日常管理** | `docker logs -f fnmusic-musicdl`<br>`docker compose ps` | `journalctl -u fnmusic-musicdl -f`<br>`systemctl status fnmusic-musicbox` |
-| **一键恢复直连** | 执行 `./restore.sh`（秒级切回原生直连；停止并删除音源容器，保留 .env 与数据） | 执行 `./restore.sh`（秒级切回原生直连；注销音源服务，保留 .env 与数据） |
-| **一键彻底卸载** | 执行 `./restore.sh --full`（额外删除 .env、网易云登录、缓存、收藏、历史与虚拟环境） | 执行 `./restore.sh --full`（同左） |
+| `fnmusic-musicbox` | `0.0.0.0:8770` | 网易云（绑定 0.0.0.0 是为了手机扫二维码登录） |
+| `fnmusic-musicdl` | `127.0.0.1:8768` | 酷我 / 咪咕 |
+| `fnmusic-lxmusic` | `127.0.0.1:8772` | 洛雪免登录解析 |
+| `fnmusic-xmly` | `127.0.0.1:8774` | 喜马拉雅有声书 |
+| `fnmusic-proxy` | — | 核心代理，接管 `/var/run/trim_music.socket` |
+
+核心代理容器以 `pid: host` + `network_mode: host` + 挂载 `/var/run`（rw）运行，
+复用宿主机 PID 与 socket 命名空间，因此接管与复原官方 socket 的 fail-closed 安全机制
+与宿主机 systemd 模式**完全一致**：`docker stop` 时自动复原，不会让飞牛音乐失联。
 
 ---
 
-### 两种模式的清理与卸载保障（零残留承诺）
-
-不论您采用哪种模式安装，项目均提供了完善、清晰的还原与彻底卸载方案：
-
-1. **日常无损还原**：
-   ```bash
-   ./restore.sh
-   ```
-   * 会立即复位 `/var/run/trim_music.socket`，停用代理服务，秒级恢复官方原生直连；
-   * 同时停止并删除音源容器/宿主机 unit（重新启用时 `install.sh` 或 `extend.sh` 会自动拉起）；
-   * `.env` 配置（含大模型 Key）与全部数据（网易云登录、缓存、在线收藏、播放历史）完好保留，
-     重装后无需重新填写任何配置。
-2. **彻底清理卸载**：
-   ```bash
-   ./restore.sh --full
-   ```
-   * 在默认还原动作之外，删除 `.env`（含历史备份）、`musicbox-data/`（网易云登录）、
-     `cache/`、`online_favorites/`、`play_history/`、`recommend_cache/` 与 `.venv-*` 虚拟环境；
-   * 仅保留代码与 git 仓库，用于彻底重置；Docker 镜像保留以便重装加速。
-   * 真正做到系统级服务干净利索、彻底无残留。
-
----
-
-## 2. 一键安装与配置
-
-### 交互向导安装（新手首选）
+## 2. 日常运维
 
 ```bash
-./install.sh
-```
-
-向导将自动执行环境安全预检，并提供直观的交互选择：
-1. **安装模式**：输入 `1`（Docker 模式）或 `2`（Host 模式）；
-2. **音源选择**：可多选，至少选一个：
-   * `1`：`musicdl`（酷我/咪咕等，覆盖绝大多数华语热门流行曲目）；
-   * `2`：`musicbox`（网易云高品质解析，支持 FLAC/歌词/封面）；
-   * `1,2`：双音源并行聚合（强烈推荐，网易云高品质优先，未命中自动回退检索）；
-3. **每日推荐（可选）**：支持填入兼容 OpenAI 规范的 API Key，自动为登录用户定制每日歌单；若不使用直接回车跳过；
-4. **一键启用**：向导完成后直接确认即可调用 `./extend.sh` 自动接管上线。
-
-### 非交互静默部署示例（进阶运维 / 自动化脚本）
-
-```bash
-# 示例 1：推荐配置 —— Docker 模式 + 双音源 + 自动启用
-./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --extend
-
-# 示例 2：纯净轻量 —— Host 宿主机模式 + 仅 musicdl 音源
-./install.sh --non-interactive --mode host --sources musicdl --extend
-
-# 示例 3：启用大模型每日推荐（密钥保存在项目本地 .env 中，权限为 600）
-./install.sh --non-interactive --mode docker --sources musicdl,musicbox,lxmusic --enable-recommend \
-  --llm-base-url 'https://api.openai.com/v1' \
-  --llm-api-key 'sk-xxxxxx' \
-  --llm-model 'gpt-4o-mini' \
-  --extend
+sudo docker compose ps                 # 看状态
+sudo docker compose logs -f proxy      # 看核心代理日志
+sudo docker compose restart musicbox   # 重启单个音源
+sudo docker compose up -d --build      # 改了服务代码后重建全部
+sudo docker compose up -d --build proxy # 只重建核心代理
 ```
 
 ---
 
-## 3. 启用与还原
+## 3. 还原与卸载
 
 ```bash
-# 1. 启用扩展接管（包含全链路健康与流式验收，失败自动秒级回滚）
-./extend.sh
+# 还原官方原生直连：停掉核心代理即可，容器退出时自动复原官方 socket
+sudo docker compose stop proxy
 
-# 2. 还原官方原生直连（停止并删除音源容器；保留 .env 与全部数据，重装免重配）
-./restore.sh
-
-# 3. 深度彻底还原（额外删除 .env、网易云登录、缓存、收藏、历史，仅保留代码）
-./restore.sh --full
+# 彻底卸载（连数据卷一起清）
+sudo docker compose down -v
+rm -rf fnmusic_ext
 ```
+
+> 多副本部署提示：容器名与端口全局固定。核心代理启动时会检查 socket 归属，
+> 遇到其他目录已接管的情况会**拒绝接管并保留现场**，禁止手工删除 socket。
+
 
 ---
 

@@ -24,6 +24,13 @@ class Unsafe(RuntimeError):
     pass
 
 
+# Canonical fnOS music socket paths. On hosts where /proc is hidden from the
+# container (hidepid=invisible), a root listener on one of these is treated as
+# the official service when its executable cannot be read (see snapshot()).
+_OFFICIAL_SOCKET_PATHS = frozenset(('/var/run/trim_music.socket',
+                                    '/var/run/trim_music_upstream.socket'))
+
+
 def move_no_replace(source, destination):
     # Atomic no-clobber publication even if the official daemon recreates a path.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -47,12 +54,23 @@ def inode(path):
 
 
 def process(pid):
+    # Kernel identity via /proc. On hardened hosts (e.g. fnOS Docker mounts
+    # /proc with hidepid=invisible) a container cannot read another process's
+    # /proc/<pid>/exe even as uid 0; degrade gracefully to a partial identity
+    # (exe=None, start=None) so callers can fall back to the kernel-verified
+    # SO_PEERCRED uid instead of refusing outright.
     try:
         text = Path(f"/proc/{pid}/stat").read_text()
-        return {"pid": pid, "start": text[text.rindex(')') + 2:].split()[19],
-                "exe": os.readlink(f"/proc/{pid}/exe")}
-    except (OSError, ValueError, IndexError):
+        start = text[text.rindex(')') + 2:].split()[19]
+    except (FileNotFoundError, ProcessLookupError):
         return None
+    except (OSError, ValueError, IndexError):
+        start = None
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = None
+    return {"pid": pid, "start": start, "exe": exe}
 
 
 def connect(path, timeout=0.4):
@@ -60,8 +78,11 @@ def connect(path, timeout=0.4):
     s.settimeout(timeout)
     try:
         s.connect(str(path))
-        pid, _, _ = struct.unpack('3i', s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-        return s, process(pid)
+        pid, uid, _ = struct.unpack('3i', s.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        peer = process(pid)
+        if peer is not None:
+            peer['uid'] = uid
+        return s, peer
     except BaseException:
         s.close()
         raise
@@ -103,13 +124,21 @@ def snapshot(path, timeout=0.9):
         if exc.errno == errno.ECONNREFUSED and inode(path) == ino:
             return {"kind": "stale", "inode": ino}
         return {"kind": "unknown", "inode": ino}
-    if inode(path) != ino or not peer:
+    if inode(path) != ino:
         raise Unsafe("socket changed during identity check")
-    # Kernel peer executable, never INVALID TOKEN forwarded by a proxy.
-    if Path(peer['exe']).name == 'trim-music':
+    if peer is None:
+        raise Unsafe("peer identity unverifiable")
+    # Kernel peer executable, never an INVALID TOKEN forwarded by a proxy.
+    exe = peer.get('exe')
+    if exe is not None and Path(exe).name == 'trim-music':
         kind = 'official'
     else:
         kind = 'unknown'
+        # Probe the listener's own liveness endpoint FIRST: it works without any
+        # /proc access and positively identifies our own proxy (which serves
+        # /_ext/livez with service='fnmusic-ext'). It must run before the uid
+        # fallback so a taken-over socket (our proxy on the canonical path) is
+        # not mistaken for the official listener.
         try:
             body, live_peer = request(path, '/_ext/livez', max(0.001, deadline-time.monotonic()))
             if (body.get('service') == 'fnmusic-ext' and
@@ -117,6 +146,13 @@ def snapshot(path, timeout=0.9):
                 kind = 'proxy'
         except (OSError, ValueError, Unsafe):
             pass
+        # Containerized fallback (fnOS Docker hides /proc via hidepid=invisible):
+        # the official trim-music runs as root on the canonical socket path, and
+        # SO_PEERCRED uid is kernel-verified. A root listener on a canonical path
+        # that does NOT answer as our proxy is accepted as official — the same
+        # trust bar as before, minus the executable-name pin.
+        if kind == 'unknown' and exe is None and peer.get('uid') == 0 and str(path) in _OFFICIAL_SOCKET_PATHS:
+            kind = 'official'
     return {"kind": kind, "inode": ino, "process": peer}
 
 
@@ -210,7 +246,11 @@ class State:
             return {}
         with os.fdopen(fd) as file:
             st = os.fstat(file.fileno())
-            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            # Only group/other WRITE bits are a tamper risk; the directory/lock
+            # checks use the same bar. Some bind-mounted host filesystems (e.g.
+            # fnOS) force group/other r-x on every created file, so a stricter
+            # "no group/other perms at all" test can never pass there.
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
                 raise Unsafe('unsafe ownership record')
             data = json.load(file)
         if data.get('target') != str(self.target) or data.get('upstream') != str(self.upstream):
@@ -584,7 +624,12 @@ def supervise(state, base):
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     # Private staging prevents uvicorn from unlinking an existing target on startup.
-    with tempfile.TemporaryDirectory(prefix='proxy-', dir=state.directory) as temp:
+    # Stage on the SAME filesystem as the target socket: the final atomic
+    # rename(RENAME_NOREPLACE) must stay in-fs. In the Docker layout state.directory
+    # (.runtime) is a bind-mount from disk, while target lives on the host /var/run
+    # tmpfs; staging there would force a cross-device rename (EXDEV, errno 18) and
+    # fail. The original systemd layout staged under /run, which is the same tmpfs.
+    with tempfile.TemporaryDirectory(prefix='proxy-', dir=str(state.target.parent)) as temp:
         staged = Path(temp) / 'listen.sock'
         failure = None
         try:

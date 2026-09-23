@@ -3,6 +3,63 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.9.0] - 2026-09-23
+
+### 新增
+
+- **综合搜索双层缓存**：musicbox 服务侧与代理聚合侧分别加 TTL 结果缓存，
+  重复搜索从 2.4~29s 降到 **0.00s**；只缓存成功结果，失败/空结果不缓存。
+- **在线收藏开关**：新增 `FNMUSIC_ONLINE_HISTORY_MODE`（`full` / `off`），
+  支持环境变量与 `/app` 文件两种来源（env 优先），管理台「配置」页新增该项。
+- **搜索失败可见**：音源并发执行、超时 25s→35s、失败自动重试一次，
+  接口返回 `warnings[]` 并在管理台橙色提示，不再「静默只剩酷我」。
+
+### 修复
+
+- **手机收藏成功但列表为空**：`online_history_mode()` 默认 off 且配置未持久化 ⇒
+  收藏请求返回成功但不入库；改为支持 `.env` 持久化并默认可开启。
+- **开了下载却没下载**：① 收藏为空导致「播放即下载」前置条件不成立；
+  ② 曲库挂在 rclone 云盘（fuse）上时容器写不进去（文件 0 字节 / ENODATA）。
+  新增 `./downloads:/app/downloads:rw` 挂载并把 `FNMUSIC_TEE_SAVE_DIR` 指向它。
+- **每日推荐播放 404**：compose 未把 `musicbox-data` 挂给 proxy ⇒ 网易云直连 cookie 恒空 ⇒
+  全部走慢速兜底并撞取流超时。补挂载后直连解析 0.12~0.29s；取流预算放宽为 12s/25s。
+- **管理台设置保存失败**：`.env` 只读挂载 + `os.replace` 跨文件系统 EBUSY。
+- **取流/搜索超时被静默吞掉**：`_mb_http` 非 200 改为抛异常，交统一包装重试 + 告警。
+
+### 移除
+
+- **歌单生成器**（自定义参数组合）功能：后端生成器区块与 `dims` / `generate` 接口，
+  前端面板与样式一并删除；残留选中态回落到「综合搜索」。
+
+### 文档
+
+- README 与 `docs/INSTALL.md` 收敛为**纯 docker-compose** 部署，
+  删除「一键脚本 / systemd」部署方式。
+
+完整说明见 [v85-变更说明.md](v85-变更说明.md)。
+
+
+## [1.8.4] - 2026-09-22
+
+### 新增
+
+- **核心代理支持容器化部署（docker-compose 一键拉起全部）**：新增 `proxy/Dockerfile`、`proxy/entrypoint.sh`、
+  `proxy/.dockerignore`，并在 `docker-compose.yml` 新增 `proxy` 服务。容器以 `pid: host` + 挂载 `/var/run`（rw）
+  + `network_mode: host` 运行，复用宿主机 PID 与 socket 命名空间，接管 `/var/run/trim_music.socket` 的
+  fail-closed 安全机制**完全不变**；`docker stop` 经 `entrypoint` 的 `exec` 把 SIGTERM 送达 `supervise()` 的
+  `finally`，自动复原官方 socket。
+- **部署模式分离**：`FNMUSIC_PROXY_MODE`（host=systemd / docker=容器）独立于 `FNMUSIC_DEPLOY_MODE`；
+  `extend.sh` / `restore.sh` / `proxy/install_common.sh` 新增对应分支与 `takeover_docker()` /
+  `wait_proxy_healthy()` / `proxy_ready()` 辅助函数。**systemd 作为一键回退完整保留**（docker 部署时仅
+  `disable` 但保留 unit 文件，不删除）。
+- **数据持久化**：`cache` / `online_favorites` / `play_history` / `recommend_cache` 与官方 `music.db`（只读）
+  由宿主机目录 bind 挂载进容器，历史收藏/播放记录不丢；接管状态目录 `.runtime/` 新增并加入 `.gitignore`。
+
+### 文档
+
+- 更新 README / docs/INSTALL.md / DIFFERENCES.md：删除「代理必须在宿主机 systemd 运行」的旧表述，改为
+  「默认 systemd、v1.8.4 起可容器化」，新增 docker 代理用法与回退说明（详见 `v84-变更说明.md`）。
+
 ## [1.8.3] - 2026-09-22
 
 ### 修复

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Path, Query, Response, status
@@ -17,6 +19,39 @@ ensure_xdg_dirs()
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
 QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
+
+# 搜索结果缓存：musicbox 每次搜索都要 spawn 一次 CLI 并打网易接口（实测 2.4~29s，偶发 504），
+# 而管理台/App 的搜索高度重复。命中缓存直接返回，把重复搜索降到毫秒级。
+_SEARCH_CACHE: dict = {}
+_SEARCH_CACHE_TTL = float(os.environ.get("MUSICBOX_SEARCH_CACHE_TTL", "600"))
+_SEARCH_CACHE_MAX = int(os.environ.get("MUSICBOX_SEARCH_CACHE_MAX", "300"))
+
+
+def _search_cache_get(key: tuple):
+    try:
+        exp, payload = _SEARCH_CACHE.get(key, (0.0, None))
+        if payload and exp > time.time():
+            return payload
+        if payload:
+            _SEARCH_CACHE.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+def _search_cache_put(key: tuple, payload: Any) -> None:
+    try:
+        if payload is None:
+            return
+        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            now = time.time()
+            for k in [k for k, v in list(_SEARCH_CACHE.items()) if v[0] <= now]:
+                _SEARCH_CACHE.pop(k, None)
+            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+                _SEARCH_CACHE.clear()
+        _SEARCH_CACHE[key] = (time.time() + _SEARCH_CACHE_TTL, payload)
+    except Exception:
+        pass
 
 
 class UpstreamException(Exception):
@@ -100,6 +135,10 @@ def search(
         raise HTTPException(status_code=400, detail="keyword cannot be empty")
     if type not in SEARCH_TYPES:
         raise HTTPException(status_code=400, detail=f"Invalid type {type!r}")
+    cache_key = (keyword.strip().lower(), type, int(limit))
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        return cached
     res = exec_musicbox(["search", keyword, "--type", type, "--limit", str(limit), "--json"])
     if type == "song" and isinstance(res, dict):
         raw_list = res.get("data")
@@ -118,6 +157,7 @@ def search(
                 res["data"] = [it for it in raw_list if isinstance(it, dict) and _song_id(it) in playable]
             else:
                 res["data"] = []
+    _search_cache_put(cache_key, res)
     return res
 
 

@@ -1,4 +1,9 @@
-fastapi>=0.110
-uvicorn>=0.29
-httpx>=0.27
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+httpx>=0.27,<1
 mutagen>=1.47
+# 锁定 starlette 到 0.x：1.x 改变了响应头/Content-Length 的处理语义，
+# 会把上游 content-length 直接用于「被改写过的」注入类响应（如 playlist/list 注入每日推荐），
+# 导致 body 与 content-length 自相矛盾 -> 发送中断 -> 客户端收到 0 字节（歌单全不显示）。
+# 加上限避免每次 docker build 静默拉入不兼容的 major 版本。
+starlette>=0.46,<1

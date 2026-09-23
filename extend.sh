@@ -136,6 +136,8 @@ MUSICDL_URL="${FNMUSIC_MUSICDL_URL:-${MUSICDL_URL}}"
 MUSICBOX_URL="${FNMUSIC_MUSICBOX_URL:-${MUSICBOX_URL}}"
 LX_URL="${FNMUSIC_LX_URL:-${LX_URL}}"
 DEPLOY_MODE="${FNMUSIC_DEPLOY_MODE:-}"
+# 代理部署模式：host=沿用 systemd（默认/回退），docker=容器化代理（见 docker-compose.yml 的 proxy 服务）
+PROXY_MODE="${FNMUSIC_PROXY_MODE:-host}"
 ENABLE_MUSICDL=0
 ENABLE_MUSICBOX=0
 ENABLE_LX=0
@@ -164,6 +166,19 @@ run_docker() {
 rollback() {
     trap - ERR INT TERM
     log_err "部署失败/中断：校验可恢复性并尝试验证回滚（不打印响应正文或环境变量）。"
+    if [ "${PROXY_MODE}" = "docker" ]; then
+        # 容器化代理：预检后停止容器，由容器退出时的 supervise() finally 自动复原官方 socket
+        if ! plan_json="$(takeover restore-plan 2>/dev/null)"; then
+            log_err "无法在停止前确认可恢复身份，保留代理运行状态并中止。请检查归属冲突后重试。"
+            exit 1
+        fi
+        log_info "回滚预检通过 (${plan_json})；停止 Docker 代理容器（退出时自动复原官方 socket）..."
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" stop proxy 2>/dev/null || true
+        sleep 3
+        run_docker compose -f "${BASE_DIR}/docker-compose.yml" rm -f proxy 2>/dev/null || true
+        log_info "Docker 代理已停止并移除；官方 socket 由容器退出流程复原。"
+        exit 1
+    fi
     if ! plan_json="$(takeover restore-plan 2>/dev/null)"; then
         log_err "无法在停止前确认可恢复身份，保留代理运行状态并中止。请检查归属冲突后重试。"
         exit 1
@@ -455,16 +470,21 @@ if [ "${ENABLE_LX}" -eq 1 ]; then
     fi
 fi
 
-# 1.5 检查 Python 虚拟环境与依赖
-if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
-    log_info "创建 .venv-proxy 虚拟环境..."
-    python3 -m venv "${BASE_DIR}/.venv-proxy"
-    "${BASE_DIR}/.venv-proxy/bin/pip" install -r "${BASE_DIR}/proxy/requirements.txt" -i "${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-fi
+# 1.5 / 1.6 宿主机依赖与预检（仅 host/systemd 模式需要；docker 模式由镜像内 .venv-proxy 提供）
+if [ "${PROXY_MODE}" = "docker" ]; then
+    log_info "Docker 代理模式：依赖由镜像内 /app/.venv-proxy 提供，跳过宿主机 venv 与 preflight。"
+else
+    # 1.5 检查 Python 虚拟环境与依赖
+    if [ ! -f "${BASE_DIR}/.venv-proxy/bin/python" ]; then
+        log_info "创建 .venv-proxy 虚拟环境..."
+        python3 -m venv "${BASE_DIR}/.venv-proxy"
+        "${BASE_DIR}/.venv-proxy/bin/pip" install -r "${BASE_DIR}/proxy/requirements.txt" -i "${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+    fi
 
-# 1.6 编译与语法检查
-takeover preflight --base "${BASE_DIR}"
-bash -n "${BASE_DIR}/proxy/run_proxy.sh"
+    # 1.6 编译与语法检查
+    takeover preflight --base "${BASE_DIR}"
+    bash -n "${BASE_DIR}/proxy/run_proxy.sh"
+fi
 
 # ------------------------------------------------------------------------------
 # 2. 幂等性检查
@@ -474,7 +494,7 @@ log_info "==> 步骤 2/5: 幂等性检查..."
 
 if [ "${FORCE_RELOAD}" -eq 1 ]; then
     log_info "已指定 --force：跳过幂等提前退出，将重写 unit 并重启代理以加载最新 .env。"
-elif takeover ready --timeout 5; then
+elif proxy_ready; then
     log_info "检测到代理服务已在运行且上游健康 (处于扩展接管态)。"
     log_info "直接运行验收测试确认状态..."
     if verify_acceptance; then
@@ -490,35 +510,55 @@ fi
 # ------------------------------------------------------------------------------
 # 3. 安装并启动 systemd unit（按当前目录生成，禁止写死个人路径）
 # ------------------------------------------------------------------------------
-log_info "==> 步骤 3/5: 安装 systemd 服务并启动接管..."
-UNIT_TMP="$(mktemp)"
-takeover render-unit --base "${BASE_DIR}" > "${UNIT_TMP}"
-# Arm rollback before any service mutation, including failed systemctl commands.
+log_info "==> 步骤 3/5: 安装并启动代理接管..."
+# Arm rollback before any service mutation, including failed systemctl / compose commands.
 trap rollback ERR INT TERM
-takeover remember
-sudo cp "${UNIT_TMP}" /etc/systemd/system/fnmusic-ext.service
-rm -f "${UNIT_TMP}"
-sudo systemctl daemon-reload
 
-if systemctl is-active --quiet fnmusic-ext.service 2>/dev/null; then
-    log_info "重启 fnmusic-ext 服务..."
-    sudo systemctl restart fnmusic-ext.service
+if [ "${PROXY_MODE}" = "docker" ]; then
+    log_info "Docker 代理模式：停用宿主机 systemd 代理（保留 unit 文件作为一键回退），改用容器接管。"
+    # 先停掉正在运行的 systemd 代理（其 ExecStopPost 会自动复原官方 socket）
+    sudo systemctl stop fnmusic-ext.service 2>/dev/null || true
+    # 禁用开机自启，避免重启后与 docker 代理争抢 socket；unit 文件保留供回退
+    sudo systemctl disable fnmusic-ext.service 2>/dev/null || true
+    # 一条命令拉起全部（含 proxy 与 4 个音源；xmly 等可选音源也随之启动）
+    if ! run_docker compose -f "${BASE_DIR}/docker-compose.yml" up -d --build; then
+        rollback
+    fi
 else
-    log_info "启用并启动 fnmusic-ext 服务..."
-    sudo systemctl enable --now fnmusic-ext.service
+    UNIT_TMP="$(mktemp)"
+    takeover render-unit --base "${BASE_DIR}" > "${UNIT_TMP}"
+    takeover remember
+    sudo cp "${UNIT_TMP}" /etc/systemd/system/fnmusic-ext.service
+    rm -f "${UNIT_TMP}"
+    sudo systemctl daemon-reload
+
+    if systemctl is-active --quiet fnmusic-ext.service 2>/dev/null; then
+        log_info "重启 fnmusic-ext 服务..."
+        sudo systemctl restart fnmusic-ext.service
+    else
+        log_info "启用并启动 fnmusic-ext 服务..."
+        sudo systemctl enable --now fnmusic-ext.service
+    fi
 fi
 
 # ------------------------------------------------------------------------------
 # 4. 等待接管完成与健康检查
 # ------------------------------------------------------------------------------
 log_info "==> 步骤 4/5: 等待代理服务接管完成并就绪..."
-# True monotonic deadline; each health request allows 4s (> 2.5s readiness budget).
-if ! takeover ready --timeout 30; then
-    log_err "等待代理身份与健康就绪超时（30s）。"
-    rollback
+if [ "${PROXY_MODE}" = "docker" ]; then
+    if ! wait_proxy_healthy 40; then
+        log_err "等待代理容器健康超时（40×2s）；容器可能接管失败，执行回滚。"
+        rollback
+    fi
+    log_info "代理容器健康（已接管并就绪）。"
+else
+    # True monotonic deadline; each health request allows 4s (> 2.5s readiness budget).
+    if ! takeover ready --timeout 30; then
+        log_err "等待代理身份与健康就绪超时（30s）。"
+        rollback
+    fi
+    log_info "Unix socket 接管成功且健康探测通过。"
 fi
-
-log_info "Unix socket 接管成功且健康探测通过。"
 
 # ------------------------------------------------------------------------------
 # 5. 验收测试与自动回滚
@@ -548,6 +588,14 @@ if [ "${ENABLE_MUSICBOX}" -eq 1 ]; then
 fi
 log_info "3. 健康检查与运维："
 log_info "   • 探测状态: curl -s --unix-socket /var/run/trim_music.socket http://localhost/_ext/healthz"
-log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
-log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
+if [ "${PROXY_MODE}" = "docker" ]; then
+    log_info "   • 代理运行模式: Docker 容器（FNMUSIC_PROXY_MODE=docker）"
+    log_info "   • 查看日志: docker logs -f fnmusic-proxy"
+    log_info "   • 一键还原: ./restore.sh（停止容器并复原官方 socket；systemd unit 已禁用并保留为回退，"
+    log_info "               之后可 ./extend.sh 或 sudo systemctl start fnmusic-ext 切回 systemd 代理）"
+else
+    log_info "   • 代理运行模式: systemd 服务（零侵入，不修改 nginx 配置）"
+    log_info "   • 查看日志: sudo journalctl -u fnmusic-ext -f"
+    log_info "   • 一键还原: ./restore.sh (一键无损切回官方原生直连)"
+fi
 log_info "============================================================"

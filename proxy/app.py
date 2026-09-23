@@ -100,6 +100,8 @@ CONF = {
     "fav_dir": os.environ.get(
         "FNMUSIC_FAV_DIR", os.path.join(_HOME, "online_favorites")
     ),
+    # v85 在线曲目是否写入收藏/历史（full=写入；off=不写入）
+    "online_history_mode": str(os.environ.get("FNMUSIC_ONLINE_HISTORY_MODE") or "off").strip().lower() or "off",
     # v50 仅收藏落盘
     "tee_favorites_only": os.environ.get("FNMUSIC_TEE_FAVORITES_ONLY", "false").lower() in ("true", "1", "yes"),
     "fav_dl_on_favorite": os.environ.get("FNMUSIC_FAV_DL_ON_FAVORITE", "true").lower() in ("true", "1", "yes"),
@@ -423,17 +425,24 @@ _MODE_CACHE = {"ts": 0.0, "val": "off"}
 
 
 def online_history_mode() -> str:
-    """full=在线曲目写入收藏/历史；off=不写入（默认，手机端列表恒为本地曲目，绝不再空白）。"""
+    """full=在线曲目写入收藏/历史；off=不写入（手机端列表恒为本地曲目）。
+
+    ★ v85：取值优先级 **环境变量 `FNMUSIC_ONLINE_HISTORY_MODE` > 文件 `_MODE_FILE` > 默认 off**。
+      旧实现只认 `/app/ONLINE_HISTORY_MODE` 这一个文件，而 `/app` 在容器里**未做持久化挂载**，
+      容器一重建设置就丢失、也无从在管理台配置 ⇒ 表现为「手机点收藏提示成功，收藏列表却空空」。
+      现在写进 `.env`（已挂载）即可长期生效，管理台设置保存也能直接改。
+    """
     try:
         now = time.time()
         if now - _MODE_CACHE["ts"] < 5.0:
             return _MODE_CACHE["val"]
         val = "off"
-        if os.path.exists(_MODE_FILE):
+        raw = str(os.environ.get("FNMUSIC_ONLINE_HISTORY_MODE") or "").strip().lower()
+        if not raw and os.path.exists(_MODE_FILE):
             with open(_MODE_FILE, "r", encoding="utf-8") as f:
                 raw = (f.read() or "").strip().lower()
-            if raw in ("full", "on", "1", "true"):
-                val = "full"
+        if raw in ("full", "on", "1", "true"):
+            val = "full"
         _MODE_CACHE["ts"] = now
         _MODE_CACHE["val"] = val
         return val
@@ -1275,8 +1284,22 @@ async def fetch_upstream_envelope(request: Request, client: httpx.AsyncClient) -
             headers=resp_headers,
             media_type=resp.headers.get("content-type"),
         )
-    payload["_ext_headers"] = resp_headers
+    payload["_ext_headers"] = _envelope_response_headers(resp_headers)
     return payload
+
+
+def _envelope_response_headers(resp_headers: dict) -> dict:
+    """给「重新序列化」的响应剔除 Content-Length。
+
+    `resp_headers` 原样透传上游（含 Content-Length）给 `Response(...)` 的纯透传分支是对的——
+    那里 body 就是上游原始字节。但 `playlist/list`、`play-history/list` 这类处理器拿到信封后
+    会**改写数据**（注入每日推荐/用户歌单等）再用 `JSONResponse` 重新序列化，body 长度已变；
+    若继续带上游的 Content-Length，Starlette(h11) 会按旧长度发送 → 长度自相矛盾 →
+    发送中断（表现为客户端收到空响应/0 字节，App 因而「歌单全不显示」）。
+    v86：这里统一剔除，交由 Starlette 按实际 body 重算。
+    """
+    return {k: v for k, v in (resp_headers or {}).items()
+            if str(k).lower() not in ("content-length", "content-encoding")}
 
 
 async def fetch_musicdl_search(client: httpx.AsyncClient, keyword: str, limit: int, sources: str | None = None) -> dict | None:
@@ -3541,7 +3564,10 @@ async def stream_track(request: Request):
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
         candidates += [online_guid_from_item(x) for x in item.get("_alternatives", []) if _same_recording(item, x)]
-    deadline = asyncio.get_running_loop().time() + 12.0
+    # ★ v80：取流启动预算放宽。实测「网易云直连 miss → musicbox 兜底」的整条解析链路
+    #   要 1.4~17s（lossless 那一次失败还要 ~10s），而旧预算只有 每次 4s / 总共 12s，
+    #   必然 TimeoutError → 404，App 表现为「每日推荐点了播不了」。
+    deadline = asyncio.get_running_loop().time() + 25.0
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue
@@ -3550,7 +3576,7 @@ async def stream_track(request: Request):
             if remaining <= 0:
                 break
             try:
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(4.0, remaining))
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(12.0, remaining))
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None
@@ -3572,7 +3598,7 @@ async def stream_track(request: Request):
                     coro_factory=lambda: _online_info(request, candidate), client_to_close=owned,
                     resolved_ext=ext, pre_info=info, chunks=chunks, first_chunk=first,
                     favorites_only=bool(CONF.get("tee_favorites_only")))
-            if attempt or deadline - asyncio.get_running_loop().time() <= 3:
+            if attempt or deadline - asyncio.get_running_loop().time() <= 5:
                 break
             if not await _recover_source(request, candidate, entry):
                 break
@@ -6119,454 +6145,6 @@ def _build_ai_tracks(key: str) -> list[dict]:
     return tracks
 
 
-# === 歌单生成器（参数组合式：地区 / 心情 / 语言 / 规模）===
-# 与 AI_PRESETS（固定预设）的区别：这里由用户在 UI 上自由组合维度，后端按所选榜单池组装。
-# 榜单 id 全部取自真实榜单（网易云 toplist 63 榜 / 酷我 bangMenu 36 榜），非编造。
-CUSTOM_SOURCE = "custom"
-GEN_SIZES = [20, 30, 40, 60]
-_GEN_DEFAULT_CHARTS = [
-    {"source": "netease", "id": "3778678"},    # 网易云热歌榜
-    {"source": "netease", "id": "3779629"},    # 网易云新歌榜
-    {"source": "netease", "id": "19723756"},   # 网易云飙升榜
-    {"source": "kuwo", "id": "16"},            # 酷我热歌榜（仅在网易不足时补齐）
-]
-
-GEN_DIMS = [
-    {"key": "region", "name": "地区", "em": "🌏", "multi": True,
-     "desc": "选择想听的国家 / 地区（可多选，混合该地榜单）。",
-     "options": [
-         {"key": "cn", "name": "中国大陆", "em": "🇨🇳",
-          "charts": [{"source": "netease", "id": "3778678"}, {"source": "netease", "id": "3779629"},
-                     {"source": "kuwo", "id": "16"}, {"source": "kuwo", "id": "104"}]},
-         {"key": "hk", "name": "香港·粤语", "em": "🇭🇰",
-          "charts": [{"source": "kuwo", "id": "182"}]},
-         {"key": "eu", "name": "欧美", "em": "🌍",
-          "charts": [{"source": "netease", "id": "2809513713"}, {"source": "netease", "id": "2809577409"},
-                     {"source": "netease", "id": "60198"}, {"source": "netease", "id": "12225155968"},
-                     {"source": "kuwo", "id": "22"}]},
-         {"key": "uk", "name": "英国", "em": "🇬🇧",
-          "charts": [{"source": "netease", "id": "180106"}, {"source": "kuwo", "id": "13"}]},
-         {"key": "jp", "name": "日本", "em": "🇯🇵",
-          "charts": [{"source": "netease", "id": "5059644681"}, {"source": "netease", "id": "60131"},
-                     {"source": "kuwo", "id": "183"}, {"source": "kuwo", "id": "15"}]},
-         {"key": "kr", "name": "韩国", "em": "🇰🇷",
-          "charts": [{"source": "netease", "id": "745956260"}, {"source": "kuwo", "id": "184"}]},
-         {"key": "sea", "name": "东南亚", "em": "🌴",
-          "charts": [{"source": "netease", "id": "6732014811"}, {"source": "netease", "id": "7095271308"}]},
-         {"key": "ru", "name": "俄罗斯", "em": "🇷🇺",
-          "charts": [{"source": "netease", "id": "6732051320"}, {"source": "netease", "id": "6939992364"}]},
-         {"key": "fr", "name": "法国", "em": "🇫🇷",
-          "charts": [{"source": "netease", "id": "27135204"}]},
-     ]},
-    {"key": "mood", "name": "心情 / 场景", "em": "💗", "multi": True,
-     "desc": "选择当下的心情或使用场景（可多选，混合风格榜）。",
-     "options": [
-         {"key": "heal", "name": "治愈·安静", "em": "🌿",
-          "charts": [{"source": "netease", "id": "5059661515"}, {"source": "netease", "id": "71384707"}]},
-         {"key": "energy", "name": "燃·运动", "em": "🔥",
-          "charts": [{"source": "netease", "id": "1978921795"}, {"source": "netease", "id": "3812895"},
-                     {"source": "kuwo", "id": "297"}, {"source": "kuwo", "id": "242"}]},
-         {"key": "party", "name": "嗨·派对", "em": "🎉",
-          "charts": [{"source": "netease", "id": "6886768100"}, {"source": "kuwo", "id": "176"},
-                     {"source": "kuwo", "id": "242"}]},
-         {"key": "nostalgia", "name": "怀旧经典", "em": "📻",
-          "charts": [{"source": "kuwo", "id": "26"}, {"source": "kuwo", "id": "64"}]},
-         {"key": "guofeng", "name": "国风古韵", "em": "🏮",
-          "charts": [{"source": "netease", "id": "5059642708"}, {"source": "kuwo", "id": "278"}]},
-         {"key": "rap", "name": "说唱街头", "em": "🎤",
-          "charts": [{"source": "netease", "id": "991319590"}, {"source": "kuwo", "id": "329"}]},
-         {"key": "rock", "name": "摇滚热血", "em": "🎸",
-          "charts": [{"source": "netease", "id": "5059633707"}]},
-         {"key": "acg", "name": "二次元", "em": "🌸",
-          "charts": [{"source": "netease", "id": "71385702"}, {"source": "netease", "id": "3001835560"},
-                     {"source": "netease", "id": "3001795926"}]},
-         {"key": "focus", "name": "专注轻音", "em": "🕯️",
-          "charts": [{"source": "netease", "id": "71384707"}]},
-         {"key": "drive", "name": "车载随行", "em": "🚗",
-          "charts": [{"source": "kuwo", "id": "328"}, {"source": "netease", "id": "6723173524"}]},
-         {"key": "ktv", "name": "欢唱 KTV", "em": "🎙️",
-          "charts": [{"source": "netease", "id": "21845217"}, {"source": "kuwo", "id": "255"}]},
-     ]},
-    {"key": "language", "name": "语言", "em": "🗣️", "multi": False,
-     "desc": "按语种过滤（基于曲目标题/艺人判别；「不限」则不过滤）。",
-     "options": [
-         {"key": "any", "name": "不限", "em": "🌐", "lang": None},
-         {"key": "zh", "name": "中文", "em": "🇨🇳", "lang": "中文"},
-         {"key": "en", "name": "英语", "em": "🔤", "lang": "英语"},
-         {"key": "ja", "name": "日语", "em": "🌸", "lang": "日语"},
-         {"key": "ko", "name": "韩语", "em": "💜", "lang": "韩语"},
-         {"key": "ru", "name": "俄语", "em": "❄️", "lang": "俄语"},
-     ]},
-]
-
-GEN_DIM_INDEX = {d["key"]: d for d in GEN_DIMS}
-_GEN_OPT_INDEX = {(d["key"], o["key"]): o for d in GEN_DIMS for o in d["options"]}
-
-
-def _gen_encode(params: dict) -> str:
-    """把生成参数编成稳定的短 key（持久化进 user_playlists.json 的 source_id）。"""
-    def _join(vals):
-        if isinstance(vals, str):
-            vals = [v.strip() for v in vals.split(",") if v.strip()]
-        vals = [str(v).strip() for v in (vals or []) if str(v).strip()]
-        seen, out = set(), []
-        for v in vals:
-            if v not in seen:
-                seen.add(v)
-                out.append(v)
-        return "-".join(out)
-
-    lang = str(params.get("language") or "any").strip() or "any"
-    try:
-        size = int(params.get("size") or 40)
-    except (TypeError, ValueError):
-        size = 40
-    if size not in GEN_SIZES:
-        size = min(GEN_SIZES, key=lambda s: abs(s - size))
-    return "r:%s;m:%s;l:%s;s:%d" % (_join(params.get("region")), _join(params.get("mood")), lang, size)
-
-
-def _gen_decode(key: str) -> dict:
-    """反解 _gen_encode 的 key（兼容手写/旧格式，未知值直接忽略）。"""
-    out = {"region": [], "mood": [], "language": "any", "size": 40}
-    for seg in str(key or "").split(";"):
-        if ":" not in seg:
-            continue
-        k, _, v = seg.partition(":")
-        v = (v or "").strip()
-        if k == "r":
-            out["region"] = [x for x in v.split("-") if x]
-        elif k == "m":
-            out["mood"] = [x for x in v.split("-") if x]
-        elif k == "l":
-            out["language"] = v or "any"
-        elif k == "s":
-            try:
-                out["size"] = int(v)
-            except (TypeError, ValueError):
-                out["size"] = 40
-    return out
-
-
-def _gen_option(dim: str, key: str) -> dict | None:
-    return _GEN_OPT_INDEX.get((str(dim or ""), str(key or "")))
-
-
-def _gen_sort_charts(charts: list[dict]) -> list[dict]:
-    """榜单排序：★ 网易云优先（用户要求「优先采用网易音源」），同音源内保持配置顺序并去重。"""
-    out, seen = [], set()
-    rank = {"netease": 0, "kuwo": 1}
-    ordered = sorted(charts or [], key=lambda c: rank.get(str(c.get("source") or "").lower(), 9))
-    for ch in ordered:
-        mark = "%s:%s" % (ch.get("source"), ch.get("id"))
-        if mark in seen:
-            continue
-        seen.add(mark)
-        out.append(ch)
-    return out
-
-
-def _gen_chart_groups(params: dict) -> list[dict]:
-    """按所选维度返回 [{dim, opt, charts}]。
-
-    ★ 保留「维度」归属是关键：旧实现把地区池与心情池混成一个扁平列表轮转取曲，
-      条目多的地区热歌榜会把席位吃光，心情参数形同虚设 —— 这正是「换任何参数都是同一批歌」的根因。
-    一个维度都没选时回退默认热门榜（网易热歌 / 新歌优先）。
-    """
-    groups = []
-    for dim in ("region", "mood"):
-        for k in (params.get(dim) or []):
-            opt = _gen_option(dim, k)
-            if not opt:
-                continue
-            groups.append({"dim": dim, "opt": k,
-                           "charts": _gen_sort_charts(opt.get("charts") or [])})
-    if not groups:
-        groups.append({"dim": "region", "opt": "", "charts": _gen_sort_charts(_GEN_DEFAULT_CHARTS)})
-    return groups
-
-
-def _gen_charts(params: dict) -> list[dict]:
-    """扁平化后的榜单列表（供预览显示「取自 N 个榜单」）。"""
-    out, seen = [], set()
-    for g in _gen_chart_groups(params):
-        for ch in g["charts"]:
-            mark = "%s:%s" % (ch.get("source"), ch.get("id"))
-            if mark not in seen:
-                seen.add(mark)
-                out.append(ch)
-    return out
-
-
-def _gen_name(params: dict) -> str:
-    parts = []
-    for dim in ("region", "mood"):
-        for k in (params.get(dim) or []):
-            opt = _gen_option(dim, k)
-            if opt:
-                parts.append(opt["name"])
-    lang_opt = _gen_option("language", params.get("language") or "any")
-    if lang_opt and lang_opt.get("lang"):
-        parts.append(lang_opt["name"] + "歌")
-    try:
-        size = int(params.get("size") or 40)
-    except (TypeError, ValueError):
-        size = 40
-    head = "·".join(parts) if parts else "热门混合"
-    return "%s %d首" % (head, size)
-
-
-# === v71：生成规则重写 ===
-# 旧规则 = 所有入选榜单「按 depth 轮转取榜首」：条目多的热歌榜会一路吃到满，
-# 条目少的心情榜几轮就抽干 ⇒ 换任何心情/语言，歌单里 45%~85% 都是同一批华语热歌（实测 9 首 8/8 常驻）。
-# 新规则四要点：
-#   (1) 维度配额：地区 / 心情 各占一半席位，维度内按选项均分、选项内按榜单均分 —— 杜绝大榜霸屏；
-#   (2) 榜内加权确定性抽样：seed 由参数 key 决定，排名靠前权重更高但不再「必然取榜首」；
-#       ⇒ 同一参数结果稳定可复现，不同参数取样窗口不同，不再恒定命中榜首那几首；
-#   (3) 网易优先：先只取网易榜单，不够再用酷我补齐（用户要求 + 顺带省掉酷我请求）；
-#   (4) 跨源去重：按「标题+艺人」规范化去重，避免网易/酷我热歌榜把同一首歌灌两次。
-
-
-def _gen_seed(key: str) -> int:
-    """由参数 key 导出稳定随机种子（同一参数 → 同一结果，不同参数 → 不同取样）。"""
-    import zlib
-    return zlib.crc32(str(key).encode("utf-8")) & 0xFFFFFFFF
-
-
-def _norm_ta(title: str, artist: str) -> str:
-    """标题+艺人 规范化（去空白/标点/括号/大小写），用于跨音源去重。"""
-    import re as _re
-    pat = r"[\s（）()\[\]【】·・,，、\-_—~～!！?？'\"“”`]+"
-    t = _re.sub(pat, "", str(title or "").lower())
-    a = _re.sub(pat, "", str(artist or "").lower())
-    return t + "|" + a
-
-
-def _gen_weighted_order(items: list, seed: int, power: float = 0.6) -> list:
-    """榜内加权随机排序（Efraimidis-Spirakis）：越靠前越容易入选，但不保证。
-
-    power 越大 → 越偏向榜单头部；0.6 实测能在「保持热度倾向」与「参数间差异化」之间取平衡。
-    """
-    import random
-    r = random.Random(seed)
-    scored = []
-    for i, it in enumerate(items):
-        w = 1.0 / ((i + 1) ** power)
-        u = r.random()
-        if u <= 0.0:
-            u = 1e-9
-        scored.append((u ** (1.0 / w), i, it))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [it for _, _, it in scored]
-
-
-def _gen_quotas(groups: list[dict], size: int) -> list[tuple]:
-    """给每个 (group, chart) 分配席位：维度均分 → 选项均分 → 榜单均分。"""
-    dims: dict = {}
-    for g in groups:
-        dims.setdefault(g["dim"], []).append(g)
-    plan = []
-    for _dim, gs in dims.items():
-        dim_quota = max(1, size // len(dims))
-        per_opt = max(1, dim_quota // max(1, len(gs)))
-        for g in gs:
-            charts = g["charts"] or [{}]
-            per_chart = max(1, per_opt // max(1, len(charts)))
-            for ch in charts:
-                plan.append((g, ch, per_chart))
-    return plan
-
-
-def _gen_fetch(charts: list[dict], tag: str) -> dict:
-    """并发取榜，返回 {mark: [picks]}。"""
-    out: dict = {}
-    if not charts:
-        return out
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _fetch(ch):
-        try:
-            return ch, _ai_chart_picks(ch)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("gen chart %s/%s failed: %s", tag, ch.get("id"), e)
-            return ch, []
-
-    try:
-        with ThreadPoolExecutor(max_workers=min(4, len(charts))) as ex:
-            for ch, got in ex.map(_fetch, list(charts)):
-                out["%s:%s" % (ch.get("source"), ch.get("id"))] = list(got or [])
-    except Exception as e:  # noqa: BLE001
-        logger.warning("gen build %s thread pool failed: %s", tag, e)
-    return out
-
-
-def _gen_take(pick: dict, used_id: set, used_ta: set) -> bool:
-    """去重后收录（id 去重 + 标题艺人跨源去重）。"""
-    pid = str(pick.get("id") or "")
-    ta = _norm_ta(pick.get("title"), pick.get("artist"))
-    dup = False
-    if pid and pid in used_id:
-        dup = True
-    if ta != "|" and ta in used_ta:
-        dup = True
-    if dup:
-        return False
-    if pid:
-        used_id.add(pid)
-    if ta != "|":
-        used_ta.add(ta)
-    return True
-
-
-def _gen_allocate(groups: list[dict], picks: dict, size: int, seed: int,
-                  lang: str | None, used_id: set, used_ta: set,
-                  only: set | None = None) -> list:
-    """按维度配额从已取到的榜单池里挑曲目（配额轮 + 补足轮）。"""
-    if size <= 0:
-        return []
-    usable, quotas, ordered = [], [], []
-    for g, ch, q in _gen_quotas(groups, size):
-        mark = "%s:%s" % (ch.get("source"), ch.get("id"))
-        if only is not None and mark not in only:
-            continue
-        rows = list(picks.get(mark) or [])
-        if lang:
-            rows = [p for p in rows if dailyrec.infer_language(
-                str(p.get("title") or ""), str(p.get("artist") or "")) == lang]
-        if not rows:
-            continue
-        usable.append((g, ch, rows))
-        quotas.append(q)
-    if not usable:
-        return []
-    for i, (_g, _ch, rows) in enumerate(usable):
-        ordered.append(_gen_weighted_order(rows, seed + i * 977))
-
-    selected: list = []
-    cursors = [0] * len(usable)
-    left = list(quotas)
-
-    # ---- 配额轮：每个榜单最多贡献自己的席位 ----
-    progress = True
-    while len(selected) < size and progress:
-        progress = False
-        for i in range(len(usable)):
-            if len(selected) >= size:
-                break
-            if left[i] <= 0:
-                continue
-            ol = ordered[i]
-            while cursors[i] < len(ol) and left[i] > 0 and len(selected) < size:
-                p = ol[cursors[i]]
-                cursors[i] += 1
-                if _gen_take(p, used_id, used_ta):
-                    selected.append(p)
-                    left[i] -= 1
-                    progress = True
-                    break
-
-    # ---- 补足轮：配额没吃满 / 池子不够时，按「网易优先」继续取 ----
-    if len(selected) < size:
-        rank = {"netease": 0, "kuwo": 1}
-        order = sorted(range(len(usable)),
-                       key=lambda i: (rank.get(str(usable[i][1].get("source") or "").lower(), 9), i))
-        for i in order:
-            ol = ordered[i]
-            while cursors[i] < len(ol) and len(selected) < size:
-                p = ol[cursors[i]]
-                cursors[i] += 1
-                if _gen_take(p, used_id, used_ta):
-                    selected.append(p)
-    return selected
-
-
-def _build_custom_tracks(key: str) -> list[dict]:
-    """按参数 key 组装自定义歌单曲目。
-
-    流程：维度分组 → 优先取网易榜 → 配额+加权抽样 → 不足再用酷我补 → 解析为可播曲目 → 缓存(6h)。
-    """
-    key = str(key or "").strip()
-    if not key:
-        return []
-    cached = _ai_load_cache("gen_" + key)
-    if cached:
-        return cached
-    params = _gen_decode(key)
-    size = int(params.get("size") or 40)
-    groups = _gen_chart_groups(params)
-    lang = (_gen_option("language", params.get("language") or "any") or {}).get("lang")
-    seed = _gen_seed(key)
-
-    # 阶段 1：只取网易榜单（音源优先级；顺带省掉酷我的请求耗时）
-    ne_charts, kw_charts = [], []
-    for g in groups:
-        for ch in g["charts"]:
-            if str(ch.get("source") or "").lower() == "netease":
-                ne_charts.append(ch)
-            else:
-                kw_charts.append(ch)
-    picks = _gen_fetch(ne_charts, key)
-    used_id: set = set()
-    used_ta: set = set()
-    selected = _gen_allocate(groups, picks, size, seed, lang, used_id, used_ta)
-    ne_yield = len(selected)
-
-    # 阶段 2：网易不足，再取酷我补齐
-    if len(selected) < size and kw_charts:
-        picks.update(_gen_fetch(kw_charts, key))
-        kw_only = {"%s:%s" % (c.get("source"), c.get("id")) for c in kw_charts}
-        selected += _gen_allocate(groups, picks, size - len(selected), seed, lang,
-                                  used_id, used_ta, only=kw_only)
-    # 兜底：所选榜单整体取不到曲（部分小语种/地区榜当前无数据，实测「法国」返回 0 首）
-    # → 回退默认热门榜补齐，避免用户点了生成却得到一张空歌单。
-    # ★ 只在「榜单本身没数据」时兜底，不用于补偿语种过滤造成的少量（那是对用户选择的忠实执行）。
-    pool_total = sum(len(v) for v in picks.values())
-    if pool_total < max(6, size // 4):
-        fb_charts = _gen_sort_charts(_GEN_DEFAULT_CHARTS)
-        picks.update(_gen_fetch(fb_charts, key + ":fb"))
-        fb_only = {"%s:%s" % (c.get("source"), c.get("id")) for c in fb_charts}
-        fb_groups = [{"dim": "region", "opt": "", "charts": fb_charts}]
-        selected += _gen_allocate(fb_groups, picks, size - len(selected), seed + 7919,
-                                  lang, used_id, used_ta, only=fb_only)
-    if not selected:
-        return []
-    tracks = dailyrec.resolve_source_candidates(selected, build_online_track, size)
-    tracks = dailyrec.stamp_playlist_tracks(tracks)
-    if tracks:
-        _ai_save_cache("gen_" + key, tracks)
-    logger.info("gen %s built: %d tracks (netease-only %d, charts %d)",
-                key, len(tracks), ne_yield, len(picks))
-    return tracks
-
-
-def _admin_playlists_dims() -> dict:
-    return {"code": 0, "dims": GEN_DIMS, "sizes": GEN_SIZES, "default_size": 40}
-
-
-def _admin_playlists_generate(body: dict) -> dict:
-    """按参数生成歌单，返回预览（名称 / 曲目数 / 样例），供 UI 确认后加入。"""
-    params = {
-        "region": body.get("region") or [],
-        "mood": body.get("mood") or [],
-        "language": str(body.get("language") or "any").strip() or "any",
-        "size": body.get("size") or 40,
-    }
-    key = _gen_encode(params)
-    name = _gen_name(params)
-    try:
-        tracks = _build_custom_tracks(key)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("generate %s failed: %s", key, e)
-        return {"code": 1, "msg": "生成失败：%s" % e, "key": key, "name": name}
-    sample = [{"title": t.get("title") or "", "artist": t.get("artist") or "",
-               "guid": t.get("guid") or ""} for t in tracks[:5]]
-    want = int(params.get("size") or 40)
-    return {"code": 0, "key": key, "name": name, "track_count": len(tracks),
-            "charts": len(_gen_charts(params)), "sample": sample,
-            "params": _gen_decode(key), "requested_size": want,
-            "low_yield": bool(len(tracks) < want), "netease_first": True}
-
-
 # === 用户管理歌单（当前歌单）===
 # 用户在管理台从各音源「加入」的歌单，持久化在 user_playlists.json；guid 前缀 online:playlist:user:
 # 注入歌单列表/paginate 取曲均复用每日推荐/心动的同一套解析路径（dailyrec.resolve_source_candidates + build_online_track）。
@@ -6991,9 +6569,6 @@ async def _build_user_bundle(app, user_id: str) -> dict:
         elif meta["source"] == "ai" and meta["source_id"]:
             # AI 歌单：按预设（语言/心情/地区）从真实榜单智能组装，已含 stamp
             tracks = _build_ai_tracks(meta["source_id"])
-        elif meta["source"] == CUSTOM_SOURCE and meta["source_id"]:
-            # 生成器歌单：按参数（地区/心情/语言/规模）组装，已含 stamp
-            tracks = _build_custom_tracks(meta["source_id"])
         elif meta["source"] == "xmly" and meta["source_id"]:
             # v77 喜马拉雅：一部小说 = 一个专辑 = 一个歌单。
             # 不走 resolve_source_candidates —— 那个是给「搜索候选」做可播性筛选的，
@@ -7197,6 +6772,9 @@ ADMIN_GROUPS = [
         "id": "download", "title": "下载管理", "icon": "↓",
         "desc": "边听边存、收藏/播放落盘与取消收藏清理。",
         "items": [
+            {"env": "FNMUSIC_ONLINE_HISTORY_MODE", "conf": "online_history_mode", "type": "text",
+             "label": "在线曲目写入收藏 / 历史", "desc": "填 full=在线歌曲可进手机端收藏与播放历史（收藏即下载、播放即下载、取消收藏即删除均依赖它）；"
+                                                       "off=只在本地曲目范围生效，手机端收藏列表恒为本地曲目。改完重启代理生效。"},
             {"env": "FNMUSIC_TEE_SAVE_ENABLED", "conf": "tee_save_enabled", "type": "bool",
              "label": "边听边存", "desc": "播放在线歌曲时同时存入飞牛曲库（默认开）。"},
             {"env": "FNMUSIC_TEE_SAVE_DIR", "conf": "tee_save_dir", "type": "text",
@@ -7379,7 +6957,22 @@ def _write_dotenv(changes: dict) -> None:
     tmp = f"{p}.{uuid4().hex[:8]}.part"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + ("\n" if out else ""))
-    os.replace(tmp, p)
+    try:
+        os.replace(tmp, p)
+    except OSError:
+        # 目标 /app/.env 是宿主机 bind-mount 文件，而 tmp 落在容器镜像层
+        # （不同文件系统），rename(2) 在此处会返回 EBUSY/EXDEV。直接把已
+        # 暂存的内容写回目标并丢弃临时文件。
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(out) + ("\n" if out else ""))
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     try:
         os.chmod(p, 0o600)
     except Exception:
@@ -7679,11 +7272,6 @@ async def admin_playlists_search_get(request: Request):
         return JSONResponse(content={"code": 1, "msg": str(e), "q": q, "results": []})
 
 
-async def admin_playlists_dims_get(request: Request):
-    """歌单生成器的可选维度（地区/心情/语言/规模）。"""
-    return JSONResponse(content=_admin_playlists_dims())
-
-
 async def admin_playlists_post(request: Request):
     try:
         body = await request.json()
@@ -7701,7 +7289,6 @@ for _NB in ("/music/api/v1/admin", "/music/api/v1/_ext/admin", "/_ext/admin"):
     app.add_api_route(_NB + "/api/playlists", admin_playlists_get, methods=["GET"])
     app.add_api_route(_NB + "/api/playlists", admin_playlists_post, methods=["POST"])
     app.add_api_route(_NB + "/api/playlists/search", admin_playlists_search_get, methods=["GET"])
-    app.add_api_route(_NB + "/api/playlists/dims", admin_playlists_dims_get, methods=["GET"])
     app.add_api_route(_NB + "/api/settings/storage", admin_storage_get, methods=["GET"])
 
 
@@ -8272,9 +7859,6 @@ def _user_playlist_track_count(source: str, source_id: str) -> int:
         if src == "ai":
             # AI 预设：组装一次即可（内部有磁盘缓存，重复调用不会反复拉榜）
             return _cached_track_count(src, sid, lambda: len(_build_ai_tracks(sid)))
-        if src == CUSTOM_SOURCE:
-            # 生成器歌单：同样有磁盘缓存；刚生成过会直接命中，不再拉榜
-            return _cached_track_count(src, sid, lambda: len(_build_custom_tracks(sid)))
         if src == "xmly":
             # v77 喜马拉雅：一部小说 = 一个专辑。曲目数直接读专辑详情（1 次 HTTP，很快），
             # 不去拉整张专辑（可能上千集）—— 这里只要个数字。
@@ -8464,9 +8048,12 @@ def _kuwo_search_playlists(keyword: str, limit: int = 20) -> list:
         return []
     url = KUWO_SEARCH_PLAYLIST_URL + "?" + _up.urlencode(
         {"key": kw, "pn": 1, "rn": max(1, min(int(limit or 20), 30))})
-    status, payload, _ = _kuwo_http(url, timeout=12)
-    if status != 200 or not isinstance(payload, dict):
-        return []
+    status, payload, raw = _kuwo_http(url, timeout=12)
+    # 同上（v80b）：非 200 抛异常，让上层能重试 + 告警，而不是静默变空
+    if status != 200:
+        raise RuntimeError("酷我返回 %s：%s" % (status, str(raw or "")[:80]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("酷我返回非 JSON：%s" % str(raw or "")[:80])
     arr = ((payload.get("data") or {}).get("list") or [])
     out = []
     for it in arr:
@@ -8498,9 +8085,16 @@ def _netease_search_playlists(keyword: str, limit: int = 20) -> list:
     if not kw:
         return []
     qs = _up.urlencode({"keyword": kw, "type": "playlist", "limit": max(1, min(int(limit or 20), 30))})
-    status, payload, _ = _mb_http("GET", "/api/v1/search?" + qs, timeout=25)
-    if status != 200 or not isinstance(payload, dict):
-        return []
+    # ★ v80：musicbox 歌单搜索冷启动实测 2.4~25.3s，25s 的预算会把它整源砍掉
+    #   （界面只剩酷我）。放宽到 35s，并配合上层并发 + 重试 + 失败可见。
+    status, payload, raw = _mb_http("GET", "/api/v1/search?" + qs, timeout=35)
+    # ★ v80b：`_mb_http` 超时/连接失败返回 (-1, None, msg) 而**不抛异常**，
+    #   旧代码在这里 `return []` => 上层既不会重试也不会告警，界面只剩酷我且无任何提示。
+    #   非 200 一律抛异常，交给 _admin_playlists_search 的统一包装去重试 + 生成 warning。
+    if status != 200:
+        raise RuntimeError("musicbox 返回 %s：%s" % (status, str(raw or "")[:80]))
+    if not isinstance(payload, dict):
+        raise RuntimeError("musicbox 返回非 JSON：%s" % str(raw or "")[:80])
     arr = payload.get("data") or []
     out = []
     for it in arr:
@@ -8513,6 +8107,46 @@ def _netease_search_playlists(keyword: str, limit: int = 20) -> list:
         out.append({"id": pid, "name": nm, "creator": str(it.get("creator_name") or ""),
                     "tracks": 0, "cover": ""})
     return out
+
+
+# === v85 综合搜索结果缓存 ===
+# 只为「反复改条件试同几个词」这类高频重复搜索兜底：命中即毫秒级返回。
+# 只缓存**有结果且无告警**的成功响应 —— 降级（某音源失败）和空结果都不缓存，
+# 否则一次偶发失败会被缓存住，用户接下来几分钟都看不到网易云。
+_SEARCH_CACHE: dict = {}
+_SEARCH_CACHE_TTL = float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "600"))
+_SEARCH_CACHE_MAX = int(os.environ.get("FNMUSIC_SEARCH_CACHE_MAX", "200"))
+
+
+def _search_cache_key(kind: str, kw: str, limit: int) -> tuple:
+    return (str(kind or "playlist"), str(kw or "").strip().lower(), int(limit or 20))
+
+
+def _search_cache_get(key: tuple):
+    try:
+        exp, payload = _SEARCH_CACHE.get(key, (0.0, None))
+        if payload and exp > time.time():
+            return payload
+        if payload:
+            _SEARCH_CACHE.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+def _search_cache_put(key: tuple, payload: dict) -> None:
+    try:
+        if not payload or payload.get("warnings") or not (payload.get("results") or []):
+            return
+        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+            now = time.time()
+            for k in [k for k, v in list(_SEARCH_CACHE.items()) if v[0] <= now]:
+                _SEARCH_CACHE.pop(k, None)
+            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+                _SEARCH_CACHE.clear()
+        _SEARCH_CACHE[key] = (time.time() + _SEARCH_CACHE_TTL, payload)
+    except Exception:
+        pass
 
 
 def _admin_playlists_search(keyword: str, limit: int = 20, kind: str = "playlist") -> dict:
@@ -8530,11 +8164,19 @@ def _admin_playlists_search(keyword: str, limit: int = 20, kind: str = "playlist
     if kind not in ("playlist", "novel"):
         kind = "playlist"
     if not kw:
-        return {"code": 0, "q": "", "kind": kind, "results": []}
+        return {"code": 0, "q": "", "kind": kind, "results": [], "warnings": []}
+    # ★ v85 搜索结果缓存：同一个关键词短期内的重复搜索直接秒回。
+    #   实测网易云歌单搜索（musicbox）冷启动 2.4~29s 且偶发 504 —— 每次都重打既慢又不稳，
+    #   而用户搜歌单基本就是反复改条件试同几个词，缓存命中率很高。
+    _ck = _search_cache_key(kind, kw, limit)
+    _hit = _search_cache_get(_ck)
+    if _hit is not None:
+        return dict(_hit, cached=True)
     results = []
+    warnings: list = []
     if kind == "novel":
         if not CONF.get("xmly_enabled", True):
-            return {"code": 0, "q": kw, "kind": kind, "results": [],
+            return {"code": 0, "q": kw, "kind": kind, "results": [], "warnings": [],
                     "msg": "喜马拉雅音源已停用。"}
         try:
             # ★ 管理台是同步的 socketserver 线程，这里用同步 HTTP 通道，
@@ -8558,24 +8200,52 @@ def _admin_playlists_search(keyword: str, limit: int = 20, kind: str = "playlist
                 })
         except Exception as e:  # noqa: BLE001
             logger.warning("xmly novel search failed: %s", e)
-        return {"code": 0, "q": kw, "kind": kind, "results": results}
+            warnings.append("喜马拉雅本次搜索失败（%s）" % type(e).__name__)
+        payload = {"code": 0, "q": kw, "kind": kind, "results": results, "warnings": warnings}
+        _search_cache_put(_ck, payload)
+        return payload
 
+    # ★ v80：两个音源**并发**跑，且失败必须可见。
+    #   旧实现是串行 + 把网易云的异常静默吞掉：网易云歌单搜索冷启动 2.4~25.3s，
+    #   一旦超时就整源消失，界面上只剩酷我，用户完全不知道网易云失败过。
+    jobs = []
     if CONF.get("netease_enabled", True):
-        try:
-            for it in _netease_search_playlists(kw, limit):
-                it.update({"source": "netease", "source_name": "网易云音乐"})
-                results.append(it)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("netease playlist search failed: %s", e)
+        jobs.append(("netease", "网易云音乐", _netease_search_playlists))
     # 酷我是否在用：与 _admin_playlists_payload 保持一致（看 online_sources 里有没有 kuwo）
     if "kuwo" in str(CONF.get("online_sources") or "").lower():
-        try:
-            for it in _kuwo_search_playlists(kw, limit):
-                it.update({"source": "kuwo", "source_name": "酷我音乐"})
-                results.append(it)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("kuwo playlist search failed: %s", e)
-    return {"code": 0, "q": kw, "kind": kind, "results": results}
+        jobs.append(("kuwo", "酷我音乐", _kuwo_search_playlists))
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _run(job):
+            key, label, fn = job
+            err = None
+            items = []
+            # 失败重试一次：第二把通常命中 musicbox 缓存（实测 2.4s）
+            for _try in range(2):
+                try:
+                    items = fn(kw, limit) or []
+                    err = None
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    err = "%s本次搜索失败（%s）" % (label, type(exc).__name__)
+                    logger.warning("playlist search %s failed on try %d: %s", key, _try + 1, exc)
+            return key, label, items, err
+
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as ex:
+            # ex.map 保序 => 网易云结果仍排在酷我之前
+            for key, label, items, err in ex.map(_run, jobs):
+                if err:
+                    warnings.append(err)
+                for it in items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    it.update({"source": key, "source_name": label})
+                    results.append(it)
+    payload = {"code": 0, "q": kw, "kind": kind, "results": results, "warnings": warnings}
+    _search_cache_put(_ck, payload)
+    return payload
 
 
 def _admin_playlists_payload() -> dict:
@@ -8646,9 +8316,6 @@ def _admin_playlists_post(body: dict) -> dict:
         pls = _load_user_playlists()
     except Exception:
         pls = []
-    if action == "generate":
-        # 参数组合式生成（仅预览，不写入）；UI 确认后再用 add(source=custom) 加入
-        return _admin_playlists_generate(body)
     if action == "add":
         source = str(body.get("source") or "netease").strip().lower()
         source_id = str(body.get("source_id") or "").strip()
@@ -8669,9 +8336,7 @@ def _admin_playlists_post(body: dict) -> dict:
         #   卡住几十秒，故这类走后台线程补算，先以 0 落盘（列表自愈 + 15 分钟缓存兜底）。
         # AI 预设需要跨多个榜单组装（数秒），同样走后台补算，别让「加入」按钮卡住。
         slow = bool(source == "ai") or bool(
-            source == "netease" and _netease_toplist_for(source_id).get("index") is None) or bool(
-            # 生成器歌单：刚生成过会命中磁盘缓存（瞬间）；未生成过则后台补算
-            source == CUSTOM_SOURCE and not _ai_load_cache("gen_" + source_id))
+            source == "netease" and _netease_toplist_for(source_id).get("index") is None)
         tc = 0 if slow else _user_playlist_track_count(source, source_id)
         pls.append({"id": pid, "source": source, "source_id": source_id, "name": name,
                     "enabled": True, "order": len(pls), "track_count": tc, "cover": cover})
@@ -8807,10 +8472,6 @@ class _AdminHTTPHandler(_AdminBaseHandler):
             return
         if path == "/admin/api/playlists":
             self._send(200, _ajson.dumps(_admin_playlists_payload(), ensure_ascii=False).encode("utf-8"),
-                       "application/json; charset=utf-8")
-            return
-        if path == "/admin/api/playlists/dims":
-            self._send(200, _ajson.dumps(_admin_playlists_dims(), ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
             return
         if path == "/admin/api/playlists/search":

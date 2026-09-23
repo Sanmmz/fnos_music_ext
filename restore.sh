@@ -21,6 +21,22 @@ TARGET_SOCK="/var/run/trim_music.socket"
 UPSTREAM_SOCK="/var/run/trim_music_upstream.socket"
 FULL_RESTORE=0
 
+# 代理模式：优先读 .env 的 FNMUSIC_PROXY_MODE；未设置则按当前运行态自动探测
+if [ -f "${BASE_DIR}/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${BASE_DIR}/.env"
+    set +a
+fi
+PROXY_MODE="${FNMUSIC_PROXY_MODE:-}"
+if [ -z "${PROXY_MODE}" ]; then
+    if proxy_container_running; then
+        PROXY_MODE="docker"
+    else
+        PROXY_MODE="host"
+    fi
+fi
+
 for arg in "$@"; do
     case "${arg}" in
         --full)
@@ -102,25 +118,45 @@ fi
 
 # Verify recoverability BEFORE any stop: unsupported legacy layout must fail
 # while the proxy is still running, never after disabling it.
-if ! plan_json="$(takeover restore-plan)"; then
-    log_err "当前 socket 状态不支持已验证的恢复，未停止任何服务。"
-    log_err "请检查是否有其他副本占用、旧版代理无身份接口，或官方应用需要重启后重试。"
-    exit 1
-fi
-log_info "恢复预检通过 (${plan_json})，记录 socket 身份并停止代理..."
-takeover remember
-if [ -f /etc/systemd/system/fnmusic-ext.service ]; then
-    sudo systemctl disable --now fnmusic-ext.service
-fi
-if ! takeover restore; then
-    log_err "未能验证官方直连恢复；保留未知 socket，不宣称成功。请排查冲突后重试。"
-    exit 1
+if [ "${PROXY_MODE}" = "docker" ]; then
+    # 容器化代理：预检后停止容器，由容器退出时的 supervise() finally 自动复原官方 socket
+    if ! plan_json="$(takeover restore-plan 2>/dev/null)"; then
+        log_err "当前 socket 状态不支持已验证的恢复，未停止任何服务。"
+        log_err "请检查是否有其他副本占用、旧版代理无身份接口，或官方应用需要重启后重试。"
+        exit 1
+    fi
+    log_info "恢复预检通过 (${plan_json})，停止 Docker 代理容器（退出时自动复原官方 socket）..."
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" stop proxy 2>/dev/null || true
+    sleep 3
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" rm -f proxy 2>/dev/null || true
+    if takeover status 2>/dev/null | grep -q '"kind": "official"'; then
+        log_info "官方 socket 已复原（target 为官方监听）。"
+    else
+        log_warn "未能确认官方 socket 复原，请检查后重启飞牛音乐或 sudo systemctl start fnmusic-ext。"
+    fi
+else
+    if ! plan_json="$(takeover restore-plan)"; then
+        log_err "当前 socket 状态不支持已验证的恢复，未停止任何服务。"
+        log_err "请检查是否有其他副本占用、旧版代理无身份接口，或官方应用需要重启后重试。"
+        exit 1
+    fi
+    log_info "恢复预检通过 (${plan_json})，记录 socket 身份并停止代理..."
+    takeover remember
+    if [ -f /etc/systemd/system/fnmusic-ext.service ]; then
+        sudo systemctl disable --now fnmusic-ext.service
+    fi
+    if ! takeover restore; then
+        log_err "未能验证官方直连恢复；保留未知 socket，不宣称成功。请排查冲突后重试。"
+        exit 1
+    fi
 fi
 
-# 2. 移除代理 systemd unit
-if [ -f "/etc/systemd/system/fnmusic-ext.service" ]; then
-    log_info "移除 /etc/systemd/system/fnmusic-ext.service..."
-    sudo rm -f /etc/systemd/system/fnmusic-ext.service
+# 2. 移除代理 systemd unit（docker 模式保留 unit 文件作为一键回退，仅停用）
+if [ "${PROXY_MODE}" != "docker" ]; then
+    if [ -f "/etc/systemd/system/fnmusic-ext.service" ]; then
+        log_info "移除 /etc/systemd/system/fnmusic-ext.service..."
+        sudo rm -f /etc/systemd/system/fnmusic-ext.service
+    fi
 fi
 sudo systemctl daemon-reload 2>/dev/null || true
 

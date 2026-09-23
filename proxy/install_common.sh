@@ -42,6 +42,43 @@ takeover() {
     sudo /usr/bin/python3 "${BASE_DIR}/proxy/takeover.py" "$@"
 }
 
+# ------------------------------------------------------------------------------
+# 容器化代理模式的辅助函数（FNMUSIC_PROXY_MODE=docker）
+# 容器以 pid: host + /var/run:rw + network_mode: host 运行，接管状态目录为
+# /app/.runtime（与 docker-compose.yml 的 .runtime 挂载一致）。
+# ------------------------------------------------------------------------------
+takeover_docker() {
+    # 在已运行的 proxy 容器内执行 takeover.py（复用容器内 .venv-proxy 与状态目录）
+    run_docker compose -f "${BASE_DIR}/docker-compose.yml" exec -T proxy \
+        /app/.venv-proxy/bin/python /app/proxy/takeover.py "$@"
+}
+
+proxy_container_running() {
+    run_docker ps --format '{{.Names}}' 2>/dev/null | grep -qx fnmusic-proxy
+}
+
+wait_proxy_healthy() {
+    # 轮询 proxy 容器的 Docker 健康状态，直到 healthy 或超时
+    local tries="${1:-40}" i hc
+    for ((i=0; i<tries; i++)); do
+        hc="$(run_docker inspect -f '{{.State.Health.Status}}' fnmusic-proxy 2>/dev/null || true)"
+        if [ "${hc}" = "healthy" ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+proxy_ready() {
+    # 两种模式的「代理已就绪」统一入口，供幂等性与等待步骤调用
+    if [ "${PROXY_MODE:-host}" = "docker" ]; then
+        proxy_container_running && takeover_docker ready --timeout 5 >/dev/null 2>&1
+    else
+        takeover ready --timeout 5
+    fi
+}
+
 wait_http() {
     local url="$1" tries="${2:-60}" delay="${3:-2}"
     # timeout bounds the whole loop, including slow responses, not only sleeps.

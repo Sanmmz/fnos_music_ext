@@ -390,7 +390,8 @@ if [ "${NON_INTERACTIVE}" -eq 0 ]; then
     echo "============================================================"
     if [ -z "${MODE}" ]; then
         echo "【安装模式说明】"
-        echo "  无论选哪种模式，核心代理（fnmusic-ext）均以宿主机 systemd 运行接管 Socket。"
+        echo "  核心代理（fnmusic-ext）默认以宿主机 systemd 运行接管 Socket；"
+        echo "  v1.8.4 起也支持容器化代理（在 .env 设 FNMUSIC_PROXY_MODE=docker），详见 README 与 v84-变更说明.md。"
         echo "  两种模式区别仅在于音源服务（musicbox/musicdl/lxmusic）的部署运行形态："
         if command -v docker >/dev/null 2>&1; then
             echo "  1) docker  — [推荐] Docker 容器模式："
