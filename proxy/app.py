@@ -131,6 +131,91 @@ CONF = {
     "llm_model": (os.environ.get("FNMUSIC_LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini",
 }
 
+# =============================================================================
+# v86：下载开关去重叠
+#
+# 旧模型有 4 个布尔开关，语义严重交叉，用户根本分不清该开哪个：
+#   tee_save_enabled(边听边存) / tee_favorites_only(仅收藏落盘) /
+#   fav_dl_on_favorite(收藏即下载) / fav_dl_on_play(播放即下载)
+# 其中「仅收藏落盘」与「收藏即下载」对同一件事（收藏的歌落盘）各说一遍，
+# 「播放即下载」又是它的补漏版本 —— 三个开关实际都在描述"收藏的歌要不要下载"。
+#
+# 新模型拆成两个**正交**维度，组合唯一、不再有重复：
+#   范围 scope    : off / favorites / all      —— 哪些曲目允许落盘
+#   时机 trigger  : favorite / favorite_play / play —— 什么时候触发整轨下载
+# 旧变量仍然读取（首次升级时按旧值推导），新变量一旦存在即优先。
+# =============================================================================
+_DOWNLOAD_SCOPES = ("off", "favorites", "all")
+_DOWNLOAD_TRIGGERS = ("favorite", "favorite_play", "play")
+
+
+def _apply_download_derived(scope: str, trigger: str) -> None:
+    """把 (范围, 时机) 展开成下游仍在用的 4 个布尔键，并回填下拉框当前值。"""
+    if scope == "off":
+        CONF["tee_save_enabled"] = False
+        CONF["tee_favorites_only"] = True
+    elif scope == "favorites":
+        CONF["tee_save_enabled"] = True
+        CONF["tee_favorites_only"] = True
+    else:  # all
+        CONF["tee_save_enabled"] = True
+        CONF["tee_favorites_only"] = False
+
+    if scope == "off":
+        CONF["fav_dl_on_favorite"] = False
+        CONF["fav_dl_on_play"] = False
+        CONF["fav_dl_play_all"] = False
+    elif trigger == "favorite":
+        CONF["fav_dl_on_favorite"] = True
+        CONF["fav_dl_on_play"] = False
+        CONF["fav_dl_play_all"] = False
+    elif trigger == "favorite_play":
+        CONF["fav_dl_on_favorite"] = True
+        CONF["fav_dl_on_play"] = True
+        CONF["fav_dl_play_all"] = False      # 补漏只补已收藏的
+    else:  # play：播放即下载，未收藏也下
+        CONF["fav_dl_on_favorite"] = False
+        CONF["fav_dl_on_play"] = True
+        CONF["fav_dl_play_all"] = True
+
+    CONF["download_scope"] = scope
+    CONF["download_trigger"] = trigger
+
+
+def _derive_download_settings() -> tuple:
+    """返回 (scope, trigger)，并把结果写回 CONF 里下游仍在用的 4 个布尔键。"""
+    raw_scope = str(os.environ.get("FNMUSIC_DOWNLOAD_SCOPE") or "").strip().lower()
+    raw_trigger = str(os.environ.get("FNMUSIC_DOWNLOAD_TRIGGER") or "").strip().lower()
+
+    # 旧值（下游代码仍在读，这里统一由新模型覆盖，保证只有一处真相）
+    legacy_tee = CONF.get("tee_save_enabled")
+    legacy_fav_only = CONF.get("tee_favorites_only")
+    legacy_on_fav = CONF.get("fav_dl_on_favorite")
+    legacy_on_play = CONF.get("fav_dl_on_play")
+
+    if raw_scope not in _DOWNLOAD_SCOPES:
+        # 首次升级：由旧开关推导
+        if not legacy_tee and not legacy_on_fav and not legacy_on_play:
+            raw_scope = "off"
+        elif legacy_fav_only or (legacy_on_fav and not legacy_tee):
+            raw_scope = "favorites"
+        else:
+            raw_scope = "all"
+
+    if raw_trigger not in _DOWNLOAD_TRIGGERS:
+        if legacy_on_fav and legacy_on_play:
+            raw_trigger = "favorite_play"
+        elif legacy_on_play:
+            raw_trigger = "play"
+        else:
+            raw_trigger = "favorite"
+
+    _apply_download_derived(raw_scope, raw_trigger)
+    return raw_scope, raw_trigger
+
+
+_DOWNLOAD_SCOPE, _DOWNLOAD_TRIGGER = _derive_download_settings()
+
 _REDACT_KEY_PARTS = ("api_key", "apikey", "token", "secret", "password")
 
 HOP_BY_HOP = {
@@ -3557,7 +3642,9 @@ async def stream_track(request: Request):
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
     # v50 播放补漏：收藏曲目在「播放起点」触发一次后台整轨落盘
     # （真实播放器按 1MB 定长窗口取流，tee 尾部落盘永远轮不到）
-    if CONF.get("fav_dl_on_play") and range_starts_at_zero(range_header) and is_favorite_online_guid(guid):
+    # v86：trigger=play 时未收藏也下载（fav_dl_play_all），否则仅对已收藏补漏
+    _dl_ok = CONF.get("fav_dl_play_all") or is_favorite_online_guid(guid)
+    if CONF.get("fav_dl_on_play") and range_starts_at_zero(range_header) and _dl_ok:
         spawn_favorite_download(request, guid)
     item, entry = _retained_track(request, guid)
     candidates = [guid]
@@ -6775,18 +6862,21 @@ ADMIN_GROUPS = [
             {"env": "FNMUSIC_ONLINE_HISTORY_MODE", "conf": "online_history_mode", "type": "text",
              "label": "在线曲目写入收藏 / 历史", "desc": "填 full=在线歌曲可进手机端收藏与播放历史（收藏即下载、播放即下载、取消收藏即删除均依赖它）；"
                                                        "off=只在本地曲目范围生效，手机端收藏列表恒为本地曲目。改完重启代理生效。"},
-            {"env": "FNMUSIC_TEE_SAVE_ENABLED", "conf": "tee_save_enabled", "type": "bool",
-             "label": "边听边存", "desc": "播放在线歌曲时同时存入飞牛曲库（默认开）。"},
+            {"env": "FNMUSIC_DOWNLOAD_SCOPE", "conf": "download_scope", "type": "enum",
+             "options": ["off", "favorites", "all"],
+             "label": "下载范围", "desc": "决定哪些曲目允许落盘：off=不自动下载；favorites=只下载收藏的曲目（推荐）；"
+                                       "all=播过的在线曲目全部落盘（会占很多空间）。"
+                                       "（此项已合并旧的「边听边存」与「仅收藏落盘」两个开关）"},
+            {"env": "FNMUSIC_DOWNLOAD_TRIGGER", "conf": "download_trigger", "type": "enum",
+             "options": ["favorite", "favorite_play", "play"],
+             "label": "下载时机", "desc": "决定什么时候整轨下载：favorite=收藏那一刻下载；"
+                                        "favorite_play=收藏时下载，另外播放已收藏曲目时补漏（推荐）；"
+                                        "play=只要播放就下载，未收藏的也下。"
+                                        "（此项已合并旧的「收藏即下载」与「播放即下载」两个开关）"},
             {"env": "FNMUSIC_TEE_SAVE_DIR", "conf": "tee_save_dir", "type": "text",
              "label": "下载目录（保存路径）", "desc": "收藏下载 / 边听边存 / 播放下载的音频统一落到这里；留空=自动探测飞牛共享曲库。保存后立即生效。"},
             {"env": "FNMUSIC_TEE_CACHE_MAX", "conf": "tee_cache_max", "type": "int",
              "label": "滚动试听缓存首数", "desc": "仅关闭边听边存时生效：完整试听的最近 N 首滚动缓存。"},
-            {"env": "FNMUSIC_TEE_FAVORITES_ONLY", "conf": "tee_favorites_only", "type": "bool",
-             "label": "仅收藏落盘", "desc": "只对收藏的在线曲目落盘，其余只试听不入库。"},
-            {"env": "FNMUSIC_FAV_DL_ON_FAVORITE", "conf": "fav_dl_on_favorite", "type": "bool",
-             "label": "收藏即下载", "desc": "收藏在线曲目时立即整轨下载到曲库。"},
-            {"env": "FNMUSIC_FAV_DL_ON_PLAY", "conf": "fav_dl_on_play", "type": "bool",
-             "label": "播放即下载", "desc": "播放在线曲目时整轨下载到曲库。"},
             {"env": "FNMUSIC_FAV_DELETE_ON_UNFAV", "conf": "fav_dl_delete_on_unfav", "type": "bool",
              "label": "取消收藏即删除", "desc": "取消收藏时删除对应音频 / 歌词 / 引用，保持曲库干净。"},
             {"env": "FNMUSIC_FAV_DL_CONCURRENCY", "conf": "fav_dl_concurrency", "type": "int",
@@ -7027,6 +7117,14 @@ def _apply_live(env: str, value) -> None:
             CONF[ck] = str(value)
     except Exception as e:
         logger.warning("live apply failed for %s: %s", env, e)
+    # v86：下载「范围/时机」是组合开关，改任一项都要重新展开成下游布尔键
+    if ck in ("download_scope", "download_trigger"):
+        try:
+            _apply_download_derived(
+                str(CONF.get("download_scope") or "favorites").strip().lower(),
+                str(CONF.get("download_trigger") or "favorite_play").strip().lower())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("download derive failed: %s", e)
 
 
 def _current_values() -> dict:
@@ -8631,6 +8729,349 @@ def _admin_tcp_startup() -> None:
 _admin_tcp_startup()
 
 
+# =============================================================================
+# v86：在线歌单「移除单曲」
+#
+# 官方飞牛只认自己库里的歌单。在线歌单（每日推荐 / 我的歌单 / 喜马拉雅…）
+# 的 remove-track 被转发到上游时，上游找不到这个 guid，静默失败 —— 表现就是
+# 「点了移除没反应，刷新又回来了」。
+# 这里按「歌单维度」持久化一份已移除曲目黑名单，列表 / 详情计数统一过滤，
+# 不动各音源自己的缓存（每日推荐缓存、用户歌单 bundle 缓存都保持原样）。
+# =============================================================================
+_PLAYLIST_REMOVED_LOCK = threading.Lock()
+
+
+def _playlist_removed_path() -> str:
+    base = CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")
+    return os.path.join(base, "playlist_removed.json")
+
+
+def _load_playlist_removed() -> dict:
+    try:
+        with open(_playlist_removed_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    out[str(k)] = [str(x) for x in v if x]
+            return out
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning("load playlist_removed failed: %s", e)
+    return {}
+
+
+def _save_playlist_removed(mapping: dict) -> None:
+    p = _playlist_removed_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    tmp = p + ".tmp"
+    with _PLAYLIST_REMOVED_LOCK:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+
+
+def _removed_tracks(guid: str) -> set:
+    try:
+        return set(_load_playlist_removed().get(guid) or [])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _add_removed_tracks(guid: str, track_guids: list) -> int:
+    m = _load_playlist_removed()
+    cur = set(m.get(guid) or [])
+    new = [g for g in track_guids if g and g not in cur]
+    if not new:
+        return 0
+    m[guid] = sorted(cur | set(new))
+    _save_playlist_removed(m)
+    return len(new)
+
+
+def _track_guid_of(item) -> str:
+    if isinstance(item, dict):
+        for k in ("guid", "trackGUID", "trackGuid", "id"):
+            v = item.get(k)
+            if v:
+                return str(v)
+        return ""
+    return str(item or "")
+
+
+def _filter_removed_tracks(guid: str, tracks: list) -> list:
+    removed = _removed_tracks(guid)
+    if not removed:
+        return list(tracks or [])
+    return [t for t in (tracks or []) if _track_guid_of(t) not in removed]
+
+
+def _is_online_playlist_guid(guid: str) -> bool:
+    return bool(
+        dailyrec.is_daily_playlist_guid(guid)
+        or is_user_playlist_guid(guid)
+        or is_xd_playlist_guid(guid)
+        or is_xmly_playlist_guid(guid)
+    )
+
+
+# =============================================================================
+# v87：把在线曲目加进「本地歌单」
+#
+# 官方库只认自己 recognize 的曲目。在线曲目（online: 前缀）写进官方歌单时，
+# 上游找不到对应 track 记录，add-track 静默失败 —— 表现就是「加不进去」。
+# 方案：官方歌单不吃的那部分，我们本地另存一份附加曲目表，读取时合并进去。
+#   online_favorites/playlist_extra.json
+#   { "<本地歌单 guid>": [ <曲目记录>, ... ] }
+# 曲目记录与 playlist-detail/list 里的条目同构，直接拼接即可。
+# =============================================================================
+_PLAYLIST_EXTRA_LOCK = threading.Lock()
+
+
+def _playlist_extra_path() -> str:
+    base = CONF.get("fav_dir") or os.path.join(_HOME, "online_favorites")
+    return os.path.join(base, "playlist_extra.json")
+
+
+def _load_playlist_extra() -> dict:
+    try:
+        with open(_playlist_extra_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    out[str(k)] = [x for x in v if isinstance(x, dict)]
+            return out
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning("load playlist_extra failed: %s", e)
+    return {}
+
+
+def _save_playlist_extra(mapping: dict) -> None:
+    p = _playlist_extra_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    tmp = p + ".tmp"
+    with _PLAYLIST_EXTRA_LOCK:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+
+
+def _extra_tracks(guid: str) -> list:
+    try:
+        return list(_load_playlist_extra().get(guid) or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _extra_count(guid: str) -> int:
+    return len(_extra_tracks(guid))
+
+
+def _add_extra_tracks(guid: str, items: list) -> int:
+    """把在线曲目记录追加到本地歌单的附加表；按 guid 去重，返回新增条数。"""
+    if not guid or not items:
+        return 0
+    m = _load_playlist_extra()
+    cur = m.get(guid) or []
+    have = {_track_guid_of(x) for x in cur}
+    added = 0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        g = _track_guid_of(it)
+        if not g or g in have:
+            continue
+        cur.append(it)
+        have.add(g)
+        added += 1
+    if added:
+        m[guid] = cur
+        _save_playlist_extra(m)
+    return added
+
+
+def _remove_extra_tracks(guid: str, track_guids: list) -> int:
+    if not guid or not track_guids:
+        return 0
+    want = {str(g) for g in track_guids if g}
+    m = _load_playlist_extra()
+    cur = m.get(guid)
+    if not cur:
+        return 0
+    keep = [x for x in cur if _track_guid_of(x) not in want]
+    removed = len(cur) - len(keep)
+    if removed:
+        if keep:
+            m[guid] = keep
+        else:
+            m.pop(guid, None)
+        _save_playlist_extra(m)
+    return removed
+
+
+def _bump_local_playlist_counts(items) -> None:
+    """给官方歌单记录补上「本地附加的在线曲目」数（就地修改）。"""
+    if not isinstance(items, list):
+        return
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        g = str(it.get("guid") or "")
+        if not g or _is_online_playlist_guid(g):
+            continue
+        n = _extra_count(g)
+        if n:
+            try:
+                it["trackCount"] = int(it.get("trackCount") or 0) + n
+            except (TypeError, ValueError):
+                it["trackCount"] = n
+
+
+async def _parse_playlist_write_body(request: Request) -> tuple:
+    """解析歌单写操作的请求体，返回 (playlist_guid, [track_guid], body)。
+
+    手机端的字段名不完全固定，JSON / form / query 三种传法都兼容。
+    """
+    body = {}
+    try:
+        raw = await request.body()
+        if raw:
+            try:
+                parsed = json.loads(raw.decode("utf-8", "replace"))
+                if isinstance(parsed, dict):
+                    body = parsed
+            except Exception:  # noqa: BLE001
+                body = {}
+        if not body:
+            try:
+                form = await request.form()
+                body = {k: v for k, v in form.items()}
+            except Exception:  # noqa: BLE001
+                body = {}
+    except Exception:  # noqa: BLE001
+        body = {}
+
+    pl_guid = ""
+    for k in ("playlistGUID", "playlistGuid", "playlist_guid", "guid", "playlistId", "id"):
+        v = body.get(k)
+        if v:
+            pl_guid = str(v).strip()
+            break
+    if not pl_guid:
+        pl_guid = str(request.query_params.get("playlistGUID")
+                      or request.query_params.get("guid") or "").strip()
+
+    raw_tracks = None
+    for k in ("trackGUIDs", "trackGuids", "track_guids", "trackGUID", "trackGuid",
+              "track_guid", "guids", "tracks", "trackIds", "ids"):
+        v = body.get(k)
+        if v:
+            raw_tracks = v
+            break
+    if raw_tracks is None:
+        raw_tracks = request.query_params.get("trackGUID") or request.query_params.get("guids")
+    if isinstance(raw_tracks, str):
+        raw_tracks = [x for x in re.split(r"[,\s]+", raw_tracks) if x]
+    elif isinstance(raw_tracks, dict):
+        raw_tracks = [raw_tracks]
+    track_guids = [g for g in (_track_guid_of(x) for x in (raw_tracks or [])) if g]
+    return pl_guid, track_guids, body
+
+
+@app.post("/music/api/v1/playlist/add-track")
+@app.post("/music/api/v1/playlist/add-track/{subpath:path}")
+async def playlist_add_track(request: Request):
+    """把曲目加进歌单：在线曲目由本地附加表托管，其余交给上游。"""
+    pl_guid, track_guids, body = await _parse_playlist_write_body(request)
+    try:
+        _probe_write("[pl-add] playlist=%s tracks=%s body_keys=%s"
+                     % (pl_guid[:48], track_guids[:3], sorted(body.keys())[:8]))
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not pl_guid or not track_guids:
+        return JSONResponse(content={"code": 1, "msg": "playlist/track guid required",
+                                     "data": None})
+
+    online_guids = [g for g in track_guids if is_online_guid(g)]
+    local_guids = [g for g in track_guids if not is_online_guid(g)]
+
+    added = 0
+    if online_guids:
+        items = []
+        for g in online_guids:
+            info = None
+            try:
+                info = await _online_info(request, g)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("add-track online info failed for %s: %s", g, e)
+            it = dict(info) if isinstance(info, dict) else {}
+            it["guid"] = str(it.get("guid") or g)
+            items.append(it)
+        try:
+            items = dailyrec.stamp_playlist_tracks(items)
+        except Exception:  # noqa: BLE001
+            pass
+        added = _add_extra_tracks(pl_guid, items)
+
+    if local_guids:
+        # 本地曲目依旧交给官方库处理（它认得这些 guid）。
+        # 混选时原始请求里带了在线 guid，上游可能整条拒绝 —— 那种情况下
+        # 至少保证在线那部分已经落库，并且仍然返回成功，避免界面报错。
+        try:
+            resp = await forward_to_upstream(request, get_upstream_client(request.app))
+            if not online_guids:
+                return resp
+        except Exception as e:  # noqa: BLE001
+            logger.warning("add-track upstream forward failed: %s", e)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"added": added}})
+
+
+@app.post("/music/api/v1/playlist/remove-track")
+@app.post("/music/api/v1/playlist/remove-track/{subpath:path}")
+async def playlist_remove_track(request: Request):
+    """移除歌单曲目：在线歌单本地记账；本地歌单里的在线曲目从附加表摘掉。"""
+    pl_guid, track_guids, _ = await _parse_playlist_write_body(request)
+    try:
+        _probe_write("[pl-remove] playlist=%s tracks=%s" % (pl_guid[:48], track_guids[:3]))
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not track_guids:
+        return JSONResponse(content={"code": 1, "msg": "track guid required", "data": None})
+
+    if _is_online_playlist_guid(pl_guid):
+        n = _add_removed_tracks(pl_guid, track_guids)
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": {"removed": n}})
+
+    # 官方歌单：先摘掉本地托管的在线曲目，剩下的（真正的本地曲目）再交给上游
+    online_guids = [g for g in track_guids if is_online_guid(g)]
+    local_guids = [g for g in track_guids if not is_online_guid(g)]
+    removed = _remove_extra_tracks(pl_guid, online_guids) if online_guids else 0
+    if not local_guids:
+        return JSONResponse(content={"code": 0, "msg": "ok",
+                                     "data": {"removed": removed}})
+    try:
+        resp = await forward_to_upstream(request, get_upstream_client(request.app))
+        if not online_guids:
+            return resp
+    except Exception as e:  # noqa: BLE001
+        logger.warning("remove-track upstream forward failed: %s", e)
+    return JSONResponse(content={"code": 0, "msg": "ok", "data": {"removed": removed}})
+
+
 @app.get("/music/api/v1/playlist/list")
 @app.get("/music/api/v1/playlist/list/{subpath:path}")
 async def playlist_list(request: Request):
@@ -8661,7 +9102,9 @@ async def playlist_list(request: Request):
         official = []
         data["list"] = official
     rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
+    # v86：扣掉已从该歌单移除的曲目，列表页 / 详情页的曲目数才和点进去看到的一致
+    rec["trackCount"] = len(_filter_removed_tracks(
+        str(rec.get("guid") or ""), list(bundle.get("tracks") or [])))
 
     # v71：心动·华语流行歌单已下线，不再注入歌单列表。
     xd_rec = None
@@ -8695,6 +9138,8 @@ async def playlist_list(request: Request):
     for _k, _v in recs_by_id.items():
         if _k not in lay:
             head.append(_v)
+    # v87：官方歌单若有本地托管的在线曲目，列表页曲目数一并补上
+    _bump_local_playlist_counts(official)
     data["list"] = head + official
     total = data.get("total")
     data["total"] = (total if isinstance(total, int) else len(official)) + len(head)
@@ -8721,7 +9166,22 @@ async def playlist_detail(request: Request):
         rec = await _xmly_album_to_playlist_record(_xmly_album_id_from_guid(guid))
         return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
     if not (dailyrec.is_daily_playlist_guid(guid) or is_xd_playlist_guid(guid) or is_user_playlist_guid(guid)):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # v87：官方歌单详情 → 补上本地托管的在线曲目数
+        n_extra = _extra_count(guid) if guid else 0
+        if not n_extra:
+            return await forward_to_upstream(request, get_upstream_client(request.app))
+        client = get_upstream_client(request.app)
+        envelope = await fetch_upstream_envelope(request, client)
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        data = envelope.get("data")
+        if isinstance(data, dict):
+            try:
+                data["trackCount"] = int(data.get("trackCount") or 0) + n_extra
+            except (TypeError, ValueError):
+                data["trackCount"] = n_extra
+        return JSONResponse(content=envelope, headers=headers)
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -8736,7 +9196,9 @@ async def playlist_detail(request: Request):
     else:
         bundle = await _load_daily_bundle(request, user_guid)
         rec = _playlist_public_fields(bundle.get("playlist") or {})
-    rec["trackCount"] = len(bundle.get("tracks") or [])
+    # v86：扣掉已从该歌单移除的曲目，列表页 / 详情页的曲目数才和点进去看到的一致
+    rec["trackCount"] = len(_filter_removed_tracks(
+        str(rec.get("guid") or ""), list(bundle.get("tracks") or [])))
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
 
 
@@ -8775,6 +9237,8 @@ async def playlist_batch_detail(request: Request):
             except Exception:
                 official_list = []
 
+    # v87：官方歌单若有本地托管的在线曲目，曲目数一并补上
+    _bump_local_playlist_counts(official_list)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
     if not is_authed and auth_resp is not None:
         return auth_resp
@@ -8789,12 +9253,16 @@ async def playlist_batch_detail(request: Request):
     if daily_ids:
         bundle = await _load_daily_bundle(request, user_guid)
         rec = _playlist_public_fields(bundle.get("playlist") or {})
-        rec["trackCount"] = len(bundle.get("tracks") or [])
+        # v86：扣掉已从该歌单移除的曲目，列表页 / 详情页的曲目数才和点进去看到的一致
+        rec["trackCount"] = len(_filter_removed_tracks(
+            str(rec.get("guid") or ""), list(bundle.get("tracks") or [])))
         local_recs.append(rec)
     if xd_ids:
         bundle = await _load_xd_bundle(request)
         rec = _xd_public_fields(bundle.get("playlist") or {})
-        rec["trackCount"] = len(bundle.get("tracks") or [])
+        # v86：扣掉已从该歌单移除的曲目，列表页 / 详情页的曲目数才和点进去看到的一致
+        rec["trackCount"] = len(_filter_removed_tracks(
+            str(rec.get("guid") or ""), list(bundle.get("tracks") or [])))
         local_recs.append(rec)
     if user_ids:
         # v72：并发 + 优先用缓存秒开。
@@ -8866,7 +9334,9 @@ async def playlist_track_list(request: Request):
     ).strip()
     if is_xmly_playlist_guid(guid):
         # v76 喜马拉雅歌单：整张专辑（可能上千集）一次性给全，支持 page/size 分页
-        all_tracks = await _xmly_playlist_tracks(_xmly_album_id_from_guid(guid))
+        # v86：喜马拉雅整张专辑也要扣掉已移除的集
+        all_tracks = _filter_removed_tracks(
+            guid, await _xmly_playlist_tracks(_xmly_album_id_from_guid(guid)))
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
@@ -8886,7 +9356,28 @@ async def playlist_track_list(request: Request):
                                      "data": {"list": page_tracks, "total": len(all_tracks),
                                               "sort": request.query_params.get("sort") or ""}})
     if not (dailyrec.is_daily_playlist_guid(guid) or is_xd_playlist_guid(guid) or is_user_playlist_guid(guid)):
-        return await forward_to_upstream(request, get_upstream_client(request.app))
+        # v87：官方歌单 → 上游列表 + 本地托管的在线曲目（若该歌单加过在线歌）
+        extra = _extra_tracks(guid) if guid else []
+        client = get_upstream_client(request.app)
+        envelope = await fetch_upstream_envelope(request, client)
+        if isinstance(envelope, Response):
+            return envelope
+        headers = envelope.pop("_ext_headers", {})
+        if extra:
+            data = envelope.get("data")
+            if not isinstance(data, dict):
+                data = {"list": [], "total": 0}
+                envelope["data"] = data
+            lst = data.get("list")
+            if not isinstance(lst, list):
+                lst = []
+            try:
+                total = int(data.get("total") or 0)
+            except (TypeError, ValueError):
+                total = len(lst)
+            data["list"] = list(lst) + list(extra)
+            data["total"] = total + len(extra)
+        return JSONResponse(content=envelope, headers=headers)
 
     upstream_client = get_upstream_client(request.app)
     is_authed, user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
@@ -8915,7 +9406,9 @@ async def playlist_track_list(request: Request):
         bundle = await _load_xd_bundle(request)
     else:
         bundle = await _load_daily_bundle(request, user_guid)
-    tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    # v86：过滤已移除的曲目（每日推荐 / 我的歌单 / 心动歌单都走这里）
+    tracks = _filter_removed_tracks(
+        guid, dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or [])))
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):

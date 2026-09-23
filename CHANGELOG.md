@@ -3,6 +3,48 @@
 本项目所有显著变更均记录于此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [1.9.2] - 2026-09-23
+
+### 新增
+
+- **在线曲目可以加进自建歌单**：新增 `POST /music/api/v1/playlist/add-track`。
+  官方库只认自己曲库里的曲目，`online:` 前缀的曲目写进官方歌单时上游静默失败
+  （返回 200 但什么都没写），表现就是「加了却是空的」。改为**本地附加表托管**：
+  在线曲目记录写入 `online_favorites/playlist_extra.json`（按歌单 guid 分组、按曲目去重），
+  在歌单详情 / 曲目列表 / 歌单列表三处合并回去，并同步 `trackCount`。
+  本地曲目仍然照旧转发上游，行为不变；混选时先保证在线部分落库，接口不再报错。
+- **本地歌单也能移除在线曲目**：`playlist/remove-track` 扩展在线曲目分支，
+  从附加表摘除；本地曲目仍转发上游。
+
+### 文档
+
+- README 重写：只保留项目最初来源说明，其余内容按实际项目重写（功能特点 + docker-compose 部署全流程）。
+
+完整说明见 [v87-变更说明.md](v87-变更说明.md)。
+
+## [1.9.1] - 2026-09-23
+
+### 变更
+
+- **下载开关去重叠**：「边听边存 / 仅收藏落盘 / 收藏即下载 / 播放即下载」4 个互相打架的
+  布尔开关，收敛为**两个正交维度** —— `FNMUSIC_DOWNLOAD_SCOPE`（`off` / `favorites` / `all`）
+  与 `FNMUSIC_DOWNLOAD_TRIGGER`（`favorite` / `favorite_play` / `play`）。
+  旧变量仍读取并自动推导，升级不丢配置。
+- **在线歌单支持移除单曲**：新增 `POST /music/api/v1/playlist/remove-track`，
+  官方不认 `online:` 前缀歌单导致移除静默失败。改为本地记账
+  （`online_favorites/playlist_removed.json`），并在曲目列表、歌单详情、
+  歌单列表三处同步过滤曲目数；官方歌单仍转发上游，行为不变。
+- **远程挂载目录恢复可用**：`docker-compose.yml` 里 `/vol02` 由 `:ro` 改为 `:rw`，
+  `.env` 的 `FNMUSIC_TEE_SAVE_DIR` 指回曲库目录。
+
+### 修正
+
+- 撤销上一版「rclone 云盘在容器里写不进去」的结论：该结论源于
+  ①compose 挂成了 `:ro`；②用 `dd` 验证（在这类 fuse 上恒为 0 字节，是工具假象）。
+  实测分块流式写与真实整轨下载均可正常落盘。
+
+完整说明见 [v86-变更说明.md](v86-变更说明.md)。
+
 ## [1.9.0] - 2026-09-23
 
 ### 新增

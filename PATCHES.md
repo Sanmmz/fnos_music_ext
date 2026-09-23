@@ -204,7 +204,7 @@ FNMUSIC_FAV_DL_MAX_BYTES=314572800     # 单曲上限 300MB
 ```
 [favdl] fail err=FileNotFoundError:
   '/vol02/<vol-id>/music/online_netease_1827600686.<uuid>.part'
-  -> '/vol2/1000/music/林达浪 _ h3R3 - 还是会想你.flac'
+  -> '/vol02/<vol-id>/music/示例歌手 - 示例歌曲.flac'
 ```
 
 **根因**：`cache/<guid>.ref` 存的是「曲库文件词干（绝对路径）」。曲库目录一旦变更，

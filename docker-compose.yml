@@ -146,16 +146,18 @@ services:
       - ./musicbox-data:/app/musicbox-data:ro
       # 官方音乐库（只读）：FNMUSIC_MUSIC_DB 默认值
       - /usr/local/apps/@appdata/trim.music/db/music.db:/usr/local/apps/@appdata/trim.music/db/music.db:ro
-      # 曲库所在存储池（可写）：「收藏即下载 / 播放即下载 / 边听边存」的音频要落到飞牛共享曲库。
+      # 曲库所在存储池（**必须 rw**）：「收藏下载 / 播放下载 / 边听边存」的音频要落到飞牛共享曲库。
       # ★ 必须挂：不挂的话容器内 /vol02 只是个空目录（容器层），文件写完宿主机曲库里根本看不到，
       #   容器一重建还全丢 —— 表现就是「设置里开了下载，却一首都没下载」。
+      # ★ 必须 rw：挂成 :ro 会直接 Read-only file system。
+      #   （rclone 云盘是 fuse 挂载，但 rw bind mount 对它一样有效：实测容器内分块流式写 4MB 正常落盘。
+      #    注意别用 dd 验证 —— dd 在这类 fuse 上会返回 0 字节 / Bad file descriptor，是假象。）
       #   若你的曲库在别的存储池（/vol01、/vol03…），照样子加一行即可。
-      - /vol02:/vol02:ro
-      # 下载落盘目录（可写）：「收藏即下载 / 播放即下载 / 边听边存」的音频写到这里，
-      # 对应 .env 的 FNMUSIC_TEE_SAVE_DIR=/app/downloads。
-      # ★ 为什么不用曲库那个云盘目录：飞牛曲库常挂在 rclone（fuse）云盘上，
-      #   容器里**看得到却写不进去**（文件能建、内容 0 字节 / ENODATA，放行 /dev/fuse + SYS_ADMIN 也无效）。
-      #   所以统一落本地盘，再由飞牛把该目录加进音乐库即可。
+      - /vol02:/vol02:rw
+      # 本地备用落盘目录（可写）：对应 .env 的 FNMUSIC_TEE_SAVE_DIR=/app/downloads。
+      # 曲库若落在 rclone 云盘上（写入较慢，实测约 1.5MB/s，一首 30MB 约 20s），
+      # 可以把保存路径改成这个本地目录，再由飞牛把该目录加进音乐库。
+      # 默认仍优先直接写曲库（/vol02/...），省一步导入。
       - ./downloads:/app/downloads:rw
     depends_on:
       musicdl:

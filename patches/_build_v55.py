@@ -37,9 +37,12 @@
                           FNMUSIC_SEARCH_ENRICH_WAIT_S（默认 1.5）
 """
 import io
+import os
 
-BASE = r"C:\Users\nas\WorkBuddy\2026-09-18-09-34-30\nas_src\app_v54.py"
-OUT = r"C:\Users\nas\WorkBuddy\2026-09-18-09-34-30\nas_src\app_v55.py"
+# 构建机本地路径已脱敏：默认读同目录下的 app_v54.py，产物写 app_v55.py；
+# 也可用环境变量覆盖（见 patches/README.md）。
+BASE = os.environ.get("FNMUSIC_BASE_APP", "app_v54.py")
+OUT = os.environ.get("FNMUSIC_OUT_APP", "app_v55.py")
 
 src = io.open(BASE, "r", encoding="utf-8").read()
 repls = []

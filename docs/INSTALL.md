@@ -11,15 +11,15 @@
 ## 0. 前置准备
 
 - **操作系统**：fnOS（Debian 12 基础系统）；
-- **基础运行组件**：Python 3.11+ 及 `python3-venv` 虚拟环境模块；
-  ```bash
-  sudo apt-get update && sudo apt-get install -y python3 python3-venv git
-  ```
+- **Docker 环境**：必须先在 fnOS「应用中心」安装好 Docker（本项目**不会**擅自安装 Docker 引擎）；
 - **管理员权限**：具备 `sudo` 执行权限的管理员账号；
-- **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」（确保存在 `/var/run/trim_music.socket`）；
-- **Docker 环境（若选 Docker 模式）**：必须先在 fnOS「应用中心」安装好 Docker，**脚本绝不会擅自安装 Docker 引擎**；
+- **官方音乐应用**：必须先在 fnOS「应用中心」安装并启动「飞牛音乐」
+  （确保存在 `/var/run/trim_music.socket`）。
 
-克隆项目并进入根目录赋予执行权限：
+> 宿主机**不需要**安装 Python 或 venv —— 所有服务都跑在容器里。
+
+克隆项目并赋予脚本执行权限：
+
 ```bash
 git clone https://github.com/Sanmmz/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
@@ -33,7 +33,7 @@ chmod +x ensure_base_image.sh
 > ⚠️ **本仓库只使用 docker-compose 部署。** 音源与核心代理全部由
 > `docker compose up -d --build` 拉起，不再需要 `install.sh` / `extend.sh`，
 > 也不再使用宿主机 systemd（host 模式仅作为应急回退保留）。
-> 完整步骤以 [README](../README.md#部署步骤) 为准，本文补充运维细节。
+> 完整步骤以 [README](../README.md) 为准，本文补充运维细节。
 
 ```bash
 cd fnmusic_ext              # 你的部署目录，例如 ~/docker/music
@@ -68,6 +68,28 @@ sudo docker compose restart musicbox   # 重启单个音源
 sudo docker compose up -d --build      # 改了服务代码后重建全部
 sudo docker compose up -d --build proxy # 只重建核心代理
 ```
+
+---
+
+## 2.5 从旧版本升级（v1.9.1 起下载开关变更）
+
+v1.9.1 起，「设置 → 下载管理」里 4 个互相打架的布尔开关收敛为**两个正交维度**：
+
+| 新变量 | 取值 | 旧变量对应关系 |
+| :--- | :--- | :--- |
+| `FNMUSIC_DOWNLOAD_SCOPE` | `off` / `favorites` / `all` | 合并 `FNMUSIC_TEE_SAVE_ENABLED` + `FNMUSIC_TEE_FAVORITES_ONLY` |
+| `FNMUSIC_DOWNLOAD_TRIGGER` | `favorite` / `favorite_play` / `play` | 合并 `FNMUSIC_FAV_DL_ON_FAVORITE` + `FNMUSIC_FAV_DL_ON_PLAY` |
+
+**升级不需要改 `.env`**：旧的 4 个变量仍会读取，并在新变量缺失时自动推导出等价配置。
+新变量一旦写入即优先。旧变量已从管理台移除，但底层仍由新模型统一展开。
+
+其他需要注意的升级点：
+
+- v1.9.1 起 `/vol02`（或你的曲库所在存储池）在 `docker-compose.yml` 里必须是 **`:rw`**，
+  否则「开了下载却一首都没下」（容器内表现为 `Read-only file system`）；
+- 曲库在 rclone 云盘上时**不要用 `dd` 验证可写性** —— `dd` 在这类 fuse 挂载上恒返回 0 字节，
+  是工具假象；用 `python` 分块写或 `cp` 一个真实文件验证；
+- 升级后建议 `sudo docker compose up -d --build` 重建镜像再 `sudo docker compose ps` 确认健康。
 
 ---
 
