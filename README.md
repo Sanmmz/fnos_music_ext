@@ -86,7 +86,6 @@ fail-closed 安全机制**与 systemd 模式完全一致**：`docker stop` 时�
 ```bash
 git clone https://github.com/Sanmmz/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
-chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh ensure_base_image.sh
 ```
 
 ### 步骤 2：准备 `.env`

@@ -142,7 +142,7 @@ v1.2.2 起已修复（镜像内文件统一 `--chown=appuser` 且权限 644，�
 升级方法：
 
 ```bash
-git pull && ./install.sh
+git pull && docker compose up -d --build
 ```
 
 Dockerfile 的变更会使对应构建层缓存失效，重新安装时会自动重建镜像，无需 `--no-cache`。
@@ -161,12 +161,16 @@ hub.rat.dev，全部失败再兜底官方源，结果缓存到 `.env` 的 `FNMUS
 手动指定（例如自动探测全部失败、或偏好特定镜像源时）：
 
 ```bash
-# 方式一：安装时通过环境变量指定
-BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh
+# 方式一：写入 .env（之后所有重建自动沿用，推荐）
+echo 'FNMUSIC_BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim' >> .env
+docker compose up -d --build
 
-# 方式二：写入 .env（之后所有重建自动沿用）
-# FNMUSIC_BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim
+# 方式二：仅本次构建生效
+FNMUSIC_BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim docker compose up -d --build
 ```
+
+> 仓库内的 `./ensure_base_image.sh` 可自动探测可用源并写回 `.env` 的 `FNMUSIC_BASE_IMAGE`
+> （可选，国内网络拉取基础镜像失败时才需要用）。
 
 自定义国内镜像候选列表：设置环境变量 `FNMUSIC_DOCKER_MIRRORS`（空格分隔，按序尝试）。
 
