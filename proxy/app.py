@@ -3557,10 +3557,6 @@ async def _resolve_xmly_url(album_id: str, track_id: str) -> tuple[str, str]:
     return url, ext
 
 
-_XMLY_URL_CACHE: dict[str, tuple] = {}
-_XMLY_URL_TTL = 1800.0
-
-
 async def _open_online_stream(request: Request, guid: str, range_header: str | None):
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
@@ -8211,9 +8207,16 @@ def _netease_search_playlists(keyword: str, limit: int = 20) -> list:
 # 只为「反复改条件试同几个词」这类高频重复搜索兜底：命中即毫秒级返回。
 # 只缓存**有结果且无告警**的成功响应 —— 降级（某音源失败）和空结果都不缓存，
 # 否则一次偶发失败会被缓存住，用户接下来几分钟都看不到网易云。
-_SEARCH_CACHE: dict = {}
-_SEARCH_CACHE_TTL = float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "600"))
-_SEARCH_CACHE_MAX = int(os.environ.get("FNMUSIC_SEARCH_CACHE_MAX", "200"))
+#
+# ★ 变量名必须与主搜索缓存（L267 的 `_SEARCH_CACHE`）区分开：
+#   两者**值类型不同** —— 主缓存存 dict（搜索结果条目，含 task/items/ts），
+#   本缓存存 (exp, payload) 元组。若同名，模块级第二次赋值会把第一次的 dict
+#   整个替换掉：管理台搜一次歌单写进来的是元组，播放链路的 `_clean_search_cache()`
+#   对元组调 `.get()` → AttributeError → 所有在线播放返回 599。
+#   改名后两套缓存彻底隔离，也避免以后再有人加第三套缓存时踩同一个坑。
+_ADMIN_SEARCH_CACHE: dict = {}
+_ADMIN_SEARCH_CACHE_TTL = float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "600"))
+_ADMIN_SEARCH_CACHE_MAX = int(os.environ.get("FNMUSIC_SEARCH_CACHE_MAX", "200"))
 
 
 def _search_cache_key(kind: str, kw: str, limit: int) -> tuple:
@@ -8222,11 +8225,11 @@ def _search_cache_key(kind: str, kw: str, limit: int) -> tuple:
 
 def _search_cache_get(key: tuple):
     try:
-        exp, payload = _SEARCH_CACHE.get(key, (0.0, None))
+        exp, payload = _ADMIN_SEARCH_CACHE.get(key, (0.0, None))
         if payload and exp > time.time():
             return payload
         if payload:
-            _SEARCH_CACHE.pop(key, None)
+            _ADMIN_SEARCH_CACHE.pop(key, None)
     except Exception:
         pass
     return None
@@ -8236,13 +8239,13 @@ def _search_cache_put(key: tuple, payload: dict) -> None:
     try:
         if not payload or payload.get("warnings") or not (payload.get("results") or []):
             return
-        if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+        if len(_ADMIN_SEARCH_CACHE) >= _ADMIN_SEARCH_CACHE_MAX:
             now = time.time()
-            for k in [k for k, v in list(_SEARCH_CACHE.items()) if v[0] <= now]:
-                _SEARCH_CACHE.pop(k, None)
-            if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
-                _SEARCH_CACHE.clear()
-        _SEARCH_CACHE[key] = (time.time() + _SEARCH_CACHE_TTL, payload)
+            for k in [k for k, v in list(_ADMIN_SEARCH_CACHE.items()) if v[0] <= now]:
+                _ADMIN_SEARCH_CACHE.pop(k, None)
+            if len(_ADMIN_SEARCH_CACHE) >= _ADMIN_SEARCH_CACHE_MAX:
+                _ADMIN_SEARCH_CACHE.clear()
+        _ADMIN_SEARCH_CACHE[key] = (time.time() + _ADMIN_SEARCH_CACHE_TTL, payload)
     except Exception:
         pass
 
